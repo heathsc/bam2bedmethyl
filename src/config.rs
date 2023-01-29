@@ -39,6 +39,9 @@ impl Config {
     pub fn output_file(&self) -> Option<&Path> {
         self.output_file.as_deref()
     }
+    pub fn compress(&self) -> bool {
+        self.compress
+    }
     pub fn ref_file(&self) -> &Path {
         &self.ref_file.as_path()
     }
@@ -139,8 +142,8 @@ pub fn handle_cli() -> anyhow::Result<Config> {
         .expect("Missing default value");
 
     let prob_threshold = match m.get_one::<f64>("min_prob").expect("Missing default value") {
-        x if (0.0..=1.0).contains(x) => Ok((x * 256.0).round().min(255.0) as u8),
-        x => Err(anyhow!("discard option {} not in range 0-1", x)),
+        x if (0.5..=1.0).contains(x) => Ok((x * 256.0).round().min(255.0) as u8),
+        x => Err(anyhow!("meth probability option {} not in range 0.5-1", x)),
     }?;
 
     // Threads option should be non-zero.  If not set, set to number of available CPUs

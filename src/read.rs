@@ -1,7 +1,7 @@
 use std::thread::{self, ScopedJoinHandle};
 
 use anyhow::Context;
-use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
 use rand::{distributions::Uniform, prelude::*};
 use rand_pcg::Pcg64Mcg;
 
@@ -18,33 +18,43 @@ use rs_htslib::{
 use super::{brec_block::*, config::Config, output, reference::Reference};
 
 pub(super) struct CpG {
-    offset: u32,
-    counts: [u32; 2],
+    pub(super) offset: u32,
+    pub(super) fwd_counts: [u32; 2],
+    pub(super) rev_counts: [u32; 2],
 }
 
 impl CpG {
     fn new(offset: u32) -> Self {
         Self {
             offset,
-            counts: [0; 2],
+            fwd_counts: [0; 2],
+            rev_counts: [0; 2],
         }
+    }
+
+    fn add_counts(&mut self, other: &Self) {
+        self.fwd_counts[0] += other.fwd_counts[0];
+        self.fwd_counts[1] += other.fwd_counts[1];
+        self.rev_counts[0] += other.rev_counts[0];
+        self.rev_counts[1] += other.rev_counts[1];
     }
 }
 
 pub(super) struct CountBlock {
-    tid: usize,
-    start: usize,
-    cpg_sites: Vec<CpG>,
+    pub(super) idx: usize,
+    pub(super) tid: usize,
+    pub(super) start: usize,
+    pub(super) cpg_sites: Vec<CpG>,
 }
 
 impl CountBlock {
     /// Initialize a new count block.  Make a list of CpG sites in the reference sequence.   Note
     /// that rf has the reference only for the region covered by the block.
-    fn new(tid: usize, start: usize, rf: &[u8]) -> Self {
+    fn new(idx: usize, tid: usize, start: usize, rf: &[u8]) -> Self {
         let mut cpg_sites = Vec::new();
 
         // Unlikely to happen, but just in case...
-        assert!(rf.len() < u32::MAX as usize, "Region to large");
+        assert!(rf.len() < u32::MAX as usize, "Region too large");
 
         // Go through reference to find CpG sites
         for (i, c) in rf.windows(2).enumerate() {
@@ -53,11 +63,71 @@ impl CountBlock {
             }
         }
         Self {
+            idx,
             tid,
             start,
             cpg_sites,
         }
     }
+
+    pub(crate) fn find_site(&mut self, x: u32, reverse: bool) -> Option<&mut [u32]> {
+        match self.cpg_sites.binary_search_by_key(&x, |c| c.offset) {
+            Ok(i) => Some(if reverse {
+                &mut self.cpg_sites[i].rev_counts
+            } else {
+                &mut self.cpg_sites[i].fwd_counts
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn end(&self) -> usize {
+        self.start + self.cpg_sites.last().map_or(0, |c| c.offset as usize)
+    }
+
+    pub(crate) fn add_counts(&mut self, other: &mut Self) {
+        assert!(self.start >= other.start);
+        // Only add counts if overlapping
+        if self.start <= other.end() && !self.cpg_sites.is_empty() {
+            let delta = (self.start - other.start) as u32;
+            let first_x = self.cpg_sites[0].offset + delta;
+            let ix = other
+                .cpg_sites
+                .binary_search_by_key(&first_x, |c| c.offset)
+                .expect("CpG site not found!");
+            for (c1, c2) in other.cpg_sites[ix..].iter().zip(self.cpg_sites.iter_mut()) {
+                c2.add_counts(c1)
+            }
+            if other.end() > self.end() {
+                let last_x = self.cpg_sites.last().map_or(0, |c| c.offset) + delta;
+                let ix = other
+                    .cpg_sites
+                    .binary_search_by_key(&last_x, |c| c.offset)
+                    .expect("CpG site not found!");
+                for mut c in other.cpg_sites.drain(ix + 1..) {
+                    c.offset -= delta;
+                    self.cpg_sites.push(c)
+                }
+            }
+        }
+    }
+    /*
+       pub(super) fn is_sorted(&self) -> bool {
+           let mut it = self.cpg_sites.iter();
+           let mut elem = match it.next() {
+               Some(e) => e,
+               None => return true,
+           };
+           for e in it {
+               if e.offset <= elem.offset {
+                   return false
+               }
+               elem = e
+           }
+           true
+       }
+
+    */
 }
 
 // Combine mod probs for the same position (i.e., for 5hmC and 5mC)
@@ -78,7 +148,7 @@ impl<'a, 'b> MethItr<'a, 'b> {
 }
 
 impl<'a, 'b> Iterator for MethItr<'a, 'b> {
-    type Item = (usize, SeqBase, Option<u8>);
+    type Item = (usize, SeqBase, Option<(u8, bool)>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
@@ -95,7 +165,7 @@ impl<'a, 'b> Iterator for MethItr<'a, 'b> {
                         Some(b'm') | Some(b'h') => t + (*p as usize),
                         _ => t,
                     });
-                    Some(tp.min(255) as u8)
+                    Some((tp.min(255) as u8, v[0].1.reverse_strand()))
                 };
                 self.seq_ix += 1;
                 Some((i, b, p))
@@ -117,28 +187,26 @@ fn get_read_coords(rec: &BamRec) -> anyhow::Result<(usize, usize, usize)> {
 
 fn process_record(
     cfg: &Config,
-    rf: &Reference,
+    rf: &[u8],
     rec: &BamRec,
     mm_parse: &mut MMParse,
-    ctg_names: &[String],
+    cb: &mut CountBlock,
 ) -> anyhow::Result<()> {
     if let Some(tags) = parse_mod_tags(rec, mm_parse)? {
         let mod_iter = mm_parse.mk_pos_iter(rec, &tags)?;
         let mut meth_itr = MethItr::new(mod_iter);
 
-        let (tid, x, y) = get_read_coords(rec)?;
-        let ctg = ctg_names[tid].as_str();
-        let r = rf.get_seq(ctg, x, y).ok_or(anyhow!(
-            "Could not get sequence for {}:{}-{}",
-            ctg,
-            x,
-            y
-        ))?;
-
+        let start_x = cb.start;
+        let thresh = cfg.prob_threshold();
+        let thresh1 = 255 - cfg.prob_threshold();
+        assert!(thresh1 < thresh);
+        let (_, x, y) = get_read_coords(rec)?;
+        assert!(start_x <= x);
+        let delta_x = x - start_x;
+        let r = &rf[delta_x..y - start_x];
+        let read_rev = rec.is_reversed();
         let mut ref_itr = r.iter().enumerate();
         let cigar = rec.cigar().ok_or(anyhow!("No CIGAR for read"))?;
-
-        println!("Read {}\t{}", rec.qname(), rec.is_reversed());
 
         for c in cigar.iter() {
             let (op, l) = c.op_pair();
@@ -150,8 +218,30 @@ fn process_record(
                     for _ in 0..l {
                         if let Some((_, b, p)) = meth_itr.next() {
                             let (i, c) = ref_itr.next().expect("Bad CIGAR");
-                            if p.is_some() {
-                                println!("{}\t{}\t{}\t{}\t{:?}", ctg, x + i, *c as char, b, p);
+                            if let Some((m, rev)) = p.and_then(|(x, rev)| {
+                                if x >= thresh {
+                                    Some((1, rev))
+                                } else if x <= thresh1 {
+                                    Some((0, rev))
+                                } else {
+                                    None
+                                }
+                            }) {
+                                // XOR
+                                let r = (read_rev || rev) && !(read_rev && rev);
+                                if let Some(z) = if r {
+                                    if i > 0 {
+                                        Some(i + delta_x - 1)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    Some(i + delta_x)
+                                } {
+                                    if let Some(ct) = cb.find_site(z as u32, r) {
+                                        ct[m] += 1;
+                                    }
+                                }
                             }
                         } else {
                             break;
@@ -202,9 +292,18 @@ fn read_thread(
         } = proc_blk;
         trace!("read thread {} received block {}", ix, idx);
 
-        let count_block =
-            process_brec_block(cfg, contigs, reference, &mut mm_parse, &mut bblock, end_pos)?;
+        let count_block = process_brec_block(
+            cfg,
+            contigs,
+            reference,
+            &mut mm_parse,
+            idx,
+            &mut bblock,
+            end_pos,
+        )?;
 
+        // Send count block to output thread
+        out_send.send(count_block)?;
         // Send completed block to back to main thread
         block_send.send(bblock)?
     }
@@ -217,18 +316,32 @@ fn process_brec_block(
     contigs: &[String],
     reference: &Reference,
     mm_parse: &mut MMParse,
+    idx: usize,
     bblock: &mut BRecBlock,
     end_pos: usize,
 ) -> anyhow::Result<CountBlock> {
     assert!(!bblock.is_empty());
     let recs = bblock.brec_vec();
     let (tid, start, _) = get_read_coords(&recs[0])?;
-    assert!(start >= end_pos);
+    assert!(start <= end_pos);
     let rf = reference
         .get_seq(contigs[tid].as_str(), start, end_pos)
-        .ok_or(anyhow!("Could not get reference for read block"))?;
+        .ok_or(anyhow!(
+            "Could not get reference sequence for contig {}",
+            contigs[tid]
+        ))?;
 
-    let mut cb = CountBlock::new(tid, start, rf);
+    trace!(
+        "Setting up count block for {}:{}-{}",
+        contigs[tid].as_str(),
+        start,
+        end_pos
+    );
+    let mut cb = CountBlock::new(idx, tid, start, rf);
+
+    for rec in recs {
+        process_record(cfg, rf, rec, mm_parse, &mut cb)?
+    }
 
     Ok(cb)
 }
@@ -287,7 +400,7 @@ pub fn read_input(cfg: &Config, rf: &Reference, mm_parse: &mut MMParse) -> anyho
     // and these are for sending used blocks back to the main thread
     let (used_send, used_recv) = unbounded();
     // These channels are for sending count data from the process threads to the output thread
-    let (out_send, out_recv) = unbounded();
+    let (out_send, out_recv) = bounded(n_proc * 8);
 
     // Create reader
     let mut rdr = SamReader::new(hts_file, hdr);
@@ -413,7 +526,7 @@ fn fill_b_rec_block(
         let discard = rng
             .as_mut()
             .map(|z| z.sample(Uniform::from(0.0..1.0)) < cfg.discard())
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         // For reads that are not down sampled, we filter on the flags and on MAPQ
         if discard
@@ -428,12 +541,12 @@ fn fill_b_rec_block(
             // Check we are still on the same contig
             let tid = rec.tid().expect("No tid for mapped record");
             let y = rec.endpos().unwrap() as usize;
-            if let Some((i, y1)) = curr.take() {
-                if i != tid {
+            if let Some((i, y1)) = curr.as_ref() {
+                if *i != tid {
                     blk.decr_ix();
                     break false;
                 }
-                curr = Some((tid, y1.max(y)))
+                curr = Some((tid, y.max(*y1)));
             } else {
                 curr = Some((tid, y))
             }
