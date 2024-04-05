@@ -1,7 +1,6 @@
-use std::num::ParseFloatError;
-use std::{ffi::OsStr, num::NonZeroUsize, path::PathBuf};
+use std::{num::NonZeroUsize, path::PathBuf};
 
-use clap::{command, error::ErrorKind, value_parser, Arg, ArgAction, Command, Error};
+use clap::{command, value_parser, Arg, ArgAction, Command};
 
 use super::utils::LogLevel;
 
@@ -90,9 +89,10 @@ pub fn cli_model() -> Command {
             Arg::new("output")
                 .short('o')
                 .long("output")
-                .value_parser(value_parser!(PathBuf))
+                .value_parser(value_parser!(String))
                 .value_name("OUTPUT_FILE")
-                .help("Output BedMethyl file"),
+                .default_value("bam2bedmethyl")
+                .help("Prefix for output files"),
         )
         .arg(
             Arg::new("compress")

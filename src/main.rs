@@ -20,6 +20,5 @@ fn main() -> anyhow::Result<()> {
     let r = reference::handle_reference(&cfg)?;
 
     // Process input
-    let mut mm_parse = rs_htslib::sam::MMParse::default();
-    read::read_input(&cfg, &r, &mut mm_parse)
+    read::read_input(&cfg, &r)
 }

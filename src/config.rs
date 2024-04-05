@@ -3,10 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use clap::ArgMatches;
 use rand::{prelude::*, rngs::StdRng};
 
-use crate::utils;
 use rs_htslib::hts::HtsThreadPool;
 
 use super::{cli::cli_model, utils::init_log};
@@ -15,15 +13,15 @@ use super::{cli::cli_model, utils::init_log};
 pub struct Config {
     // Input file - if none, input from stdin
     input_file: Option<PathBuf>,
-    // Output file - if not, output to stdout
-    output_file: Option<PathBuf>,
+    // Output file prefix - if not, set to bam2bedmethyl
+    output_prefix: String,
     compress: bool,
     // Path to fasta file (possibly compressed) with reference sequence
     ref_file: PathBuf,
-    // Down sampling - select proportion of reads that are discarded.  Must be in 0.0..=1.0
+    // Down sampling - select proportion of reads that are discarded.  Must be in 0.0...=1.0
     discard: f64,
     seed: u64,
-    // Filtering (carried out *after* any down sampling.  Note that prob threshold is scaled from 0
+    // Filtering (carried out *after* any down sampling).  Note that prob threshold is scaled from 0
     // to 255 so that x is a prob. between x / 256 and (x + 1) / 256
     mapq_threshold: u8,
     prob_threshold: u8,
@@ -36,8 +34,8 @@ impl Config {
     pub fn input_file(&self) -> Option<&Path> {
         self.input_file.as_deref()
     }
-    pub fn output_file(&self) -> Option<&Path> {
-        self.output_file.as_deref()
+    pub fn output_prefix(&self) -> &str {
+        &self.output_prefix
     }
     pub fn compress(&self) -> bool {
         self.compress
@@ -63,47 +61,6 @@ impl Config {
     pub fn hts_thread_pool(&self) -> Option<&HtsThreadPool> {
         self.hts_thread_pool.as_ref()
     }
-}
-
-/// Get output file and compress options from command line
-/// If compress is not set and the output file is set, set compress option based on the output
-/// filename extension.  
-/// If compress is set and output filename is set, add a gz extension if not already present.
-/// If compress is set and output filename is not set, check whether we are outputting to a tty
-/// and, if so, turn off compression
-fn get_output(m: &ArgMatches) -> (Option<PathBuf>, bool) {
-    // Get options from CLI
-    let mut compress = m.get_flag("compress");
-    let mut pathbuf = m.get_one::<PathBuf>("output").map(|p| p.to_owned());
-
-    if let Some(mut p) = pathbuf.take() {
-        // If output filename set...
-        if let Some(ext) = p.extension() {
-            // If filename has an extension...
-            if ext == "gz" {
-                // If extension is gz, set compress irrespective of CLI compress option
-                compress = true
-            } else if compress {
-                // Otherwise if CLI compress option set, add gz extension to filename
-                let mut s = p.into_os_string();
-                s.push(".gz");
-                p = PathBuf::from(s)
-            }
-        } else if compress {
-            // If CLI option set and the filename has no extension, add gz extension to filename
-            p.set_extension("gz");
-        }
-        pathbuf = Some(p)
-    } else {
-        // No output filename set.  Check if compress option is set and output is to tty.
-        // If so, turn off compression
-        if compress && utils::isatty(libc::STDOUT_FILENO) {
-            warn!("Terminal output will not be compressed");
-            compress = false;
-        }
-    }
-
-    (pathbuf, compress)
 }
 
 pub fn handle_cli() -> anyhow::Result<Config> {
@@ -159,11 +116,15 @@ pub fn handle_cli() -> anyhow::Result<Config> {
         None
     };
 
-    let (output_file, compress) = get_output(&m);
+    let compress = m.get_flag("compress");
+    let output_prefix = m
+        .get_one::<String>("output")
+        .map(|p| p.to_owned())
+        .expect("Missing default output option");
 
     Ok(Config {
         input_file,
-        output_file,
+        output_prefix,
         ref_file,
         compress,
         discard,

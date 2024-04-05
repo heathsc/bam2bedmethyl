@@ -71,12 +71,4 @@ impl ProcessBlock {
             bblock,
         }
     }
-
-    pub(super) fn idx(&self) -> usize {
-        self.idx
-    }
-
-    pub(super) fn end_pos(&self) -> usize {
-        self.end_pos
-    }
 }

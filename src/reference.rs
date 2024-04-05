@@ -51,7 +51,7 @@ impl<'a> FastaFile<'a> {
             .bufreader()
             .with_context(|| format!("Error opening FASTA file {}", path.display()))?;
         Ok(Self {
-            path: path.as_ref(),
+            path,
             line: 0,
             buf: String::new(),
             rdr,
@@ -82,45 +82,30 @@ impl<'a> FastaFile<'a> {
     }
 
     fn read_fasta_record(&mut self) -> anyhow::Result<Option<RefContig>> {
-        loop {
-            if self.get_next_non_empty_line()? {
-                return Ok(None); // EOF
-            }
-
-            // Get contig name
-            let name = Arc::from(parse_name(&self.buf).with_context(|| {
-                format!(
-                    "{}:{} Error reading FASTA name",
-                    self.path.display(),
-                    self.line
-                )
-            })?);
-
-            // Read sequence
-            trace!("Reading sequence {}", &name);
-            let seq = self
-                .read_sequence()
-                .with_context(|| format!("Error reading sequence for contig {}", name))?;
-
-            debug!("Read {}, length {}", &name, seq.len());
-            return Ok(Some(RefContig {
-                name,
-                seq: RefSeq::Vec(seq),
-            }));
+        if self.get_next_non_empty_line()? {
+            return Ok(None); // EOF
         }
-    }
 
-    fn skip_sequence(&mut self) -> anyhow::Result<()> {
-        while !self.get_line()? {
-            if self.buf.starts_with('>') {
-                break;
-            }
-            let s = self.buf.trim_end();
-            if s.is_empty() {
-                break;
-            }
-        }
-        Ok(())
+        // Get contig name
+        let name = Arc::from(parse_name(&self.buf).with_context(|| {
+            format!(
+                "{}:{} Error reading FASTA name",
+                self.path.display(),
+                self.line
+            )
+        })?);
+
+        // Read sequence
+        trace!("Reading sequence {}", &name);
+        let seq = self
+            .read_sequence()
+            .with_context(|| format!("Error reading sequence for contig {}", name))?;
+
+        debug!("Read {}, length {}", &name, seq.len());
+        Ok(Some(RefContig {
+            name,
+            seq: RefSeq::Vec(seq),
+        }))
     }
 
     fn read_sequence(&mut self) -> anyhow::Result<Vec<u8>> {
@@ -337,7 +322,7 @@ fn load_reference_from_faidx(cfg: &Config, faidx: Faidx) -> anyhow::Result<Refer
 }
 
 /// Check if reference file has faidx index.  If so then we read it in using htslib
-/// (multithreaded if requested).  Otherwise we read it in as a standard (possibly compressed)
+/// (multithreaded if requested).  Otherwise, we read it in as a standard (possibly compressed)
 /// FASTA file.
 pub fn handle_reference(cfg: &Config) -> anyhow::Result<Reference> {
     // Try to load faidx index

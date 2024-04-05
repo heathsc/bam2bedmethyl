@@ -8,35 +8,37 @@ use rand_pcg::Pcg64Mcg;
 use rs_htslib::{
     hts::{HtsFile, HtsMode, HtsRead},
     sam::{
-        find_mod_tags, parse_mod_tags, BamAux, BamAuxItem, BamRec, CigarOp, MMParse, ModIter,
-        Modification, SamHeader, SamReader, SeqBase, BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY,
-        BAM_FSUPPLEMENTARY, BAM_FUNMAP,
+        parse_mod_tags, BamRec, CigarOp, MMParse, ModIter, SamHeader, SamReader, SeqBase, BAM_FDUP,
+        BAM_FQCFAIL, BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP,
     },
-    HStr,
 };
 
 use super::{brec_block::*, config::Config, output, reference::Reference};
 
+/// The counts are:
+///   0 - not modified
+///   1 - 5mC or 5hmC
+///   2 - 5mC
+///   3 - 5hmC
 pub(super) struct CpG {
     pub(super) offset: u32,
-    pub(super) fwd_counts: [u32; 2],
-    pub(super) rev_counts: [u32; 2],
+    pub(super) fwd_counts: [u32; 4],
+    pub(super) rev_counts: [u32; 4],
 }
 
 impl CpG {
     fn new(offset: u32) -> Self {
         Self {
             offset,
-            fwd_counts: [0; 2],
-            rev_counts: [0; 2],
+            fwd_counts: [0; 4],
+            rev_counts: [0; 4],
         }
     }
 
     fn add_counts(&mut self, other: &Self) {
-        self.fwd_counts[0] += other.fwd_counts[0];
-        self.fwd_counts[1] += other.fwd_counts[1];
-        self.rev_counts[0] += other.rev_counts[0];
-        self.rev_counts[1] += other.rev_counts[1];
+        for (p1, p2) in self.fwd_counts.iter_mut().zip(self.rev_counts.iter()) {
+            *p1 += *p2
+        }
     }
 }
 
@@ -111,26 +113,9 @@ impl CountBlock {
             }
         }
     }
-    /*
-       pub(super) fn is_sorted(&self) -> bool {
-           let mut it = self.cpg_sites.iter();
-           let mut elem = match it.next() {
-               Some(e) => e,
-               None => return true,
-           };
-           for e in it {
-               if e.offset <= elem.offset {
-                   return false
-               }
-               elem = e
-           }
-           true
-       }
-
-    */
 }
 
-// Combine mod probs for the same position (i.e., for 5hmC and 5mC)
+// Combine mod probabilities for the same position (i.e., for 5hmC and 5mC)
 struct MethItr<'a, 'b> {
     mod_iter: ModIter<'a, 'b>,
     seq_ix: usize,
@@ -148,31 +133,36 @@ impl<'a, 'b> MethItr<'a, 'b> {
 }
 
 impl<'a, 'b> Iterator for MethItr<'a, 'b> {
-    type Item = (usize, SeqBase, Option<(u8, bool)>);
+    type Item = (usize, SeqBase, Option<(u8, u8, bool)>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
             None
-        } else {
-            if let Some(d) = self.mod_iter.next_pos() {
-                let i = self.seq_ix;
-                let b = d.seq_base();
-                let v = d.data();
-                let p = if v.is_empty() {
-                    None
-                } else {
-                    let tp = v.iter().fold(0, |t, (p, m)| match m.base_mod_code() {
-                        Some(b'm') | Some(b'h') => t + (*p as usize),
-                        _ => t,
-                    });
-                    Some((tp.min(255) as u8, v[0].1.reverse_strand()))
-                };
-                self.seq_ix += 1;
-                Some((i, b, p))
-            } else {
-                self.finished = true;
+        } else if let Some(d) = self.mod_iter.next_pos() {
+            let i = self.seq_ix;
+            let b = d.seq_base();
+            let v = d.data();
+            let p = if v.is_empty() {
                 None
-            }
+            } else {
+                let (tp_m, tp_h) =
+                    v.iter()
+                        .fold((0, 0), |(t_m, t_h), (p, m)| match m.base_mod_code() {
+                            Some(b'm') => (t_m + (*p as usize), t_h),
+                            Some(b'h') => (t_m, t_h + (*p as usize)),
+                            _ => (t_m, t_h),
+                        });
+                Some((
+                    tp_m.min(255) as u8,
+                    tp_h.min(255) as u8,
+                    v[0].1.reverse_strand(),
+                ))
+            };
+            self.seq_ix += 1;
+            Some((i, b, p))
+        } else {
+            self.finished = true;
+            None
         }
     }
 }
@@ -192,36 +182,67 @@ fn process_record(
     mm_parse: &mut MMParse,
     cb: &mut CountBlock,
 ) -> anyhow::Result<()> {
+    // Find and parse MM/ML tags from record
     if let Some(tags) = parse_mod_tags(rec, mm_parse)? {
+        // Tags found.  Make iterator over modified positions
         let mod_iter = mm_parse.mk_pos_iter(rec, &tags)?;
         let mut meth_itr = MethItr::new(mod_iter);
 
-        let start_x = cb.start;
+        // Threshold (on prob. scale of 0-255) for calling methylated or non-methylation sites
         let thresh = cfg.prob_threshold();
         let thresh1 = 255 - cfg.prob_threshold();
+        // Sanity check
         assert!(thresh1 < thresh);
-        let (_, x, y) = get_read_coords(rec)?;
-        assert!(start_x <= x);
-        let delta_x = x - start_x;
-        let r = &rf[delta_x..y - start_x];
-        let read_rev = rec.is_reversed();
-        let mut ref_itr = r.iter().enumerate();
-        let cigar = rec.cigar().ok_or(anyhow!("No CIGAR for read"))?;
 
+        // We go through the read following the CIGAR string, so we can match up the reference and
+        // the read and match these up to the reported modifications
+
+        // Get start of current count block
+        let start_x = cb.start;
+
+        // Get map coordinates from record (we should only have mapped reads here)
+        let (_, x, y) = get_read_coords(rec)?;
+
+        // Is read reversed in record compared to its original (sequenced) orientation
+        let read_rev = rec.is_reversed();
+
+        // Sanity check - we should only have reads that come at of after the start of the count block
+        assert!(start_x <= x);
+
+        // Difference between the starting map position and the start of the count block
+        let delta_x = x - start_x;
+
+        // Get reference seq and make an iterator over it
+        let r = &rf[delta_x..y - start_x];
+        let mut ref_itr = r.iter().enumerate();
+
+        // Iterate through cigar ops
+        let cigar = rec.cigar().ok_or(anyhow!("No CIGAR for read"))?;
         for c in cigar.iter() {
             let (op, l) = c.op_pair();
+
+            // Not sure why we would have zero length cigar ops, but if we do we will ignore them
             if l == 0 {
                 continue;
             }
+
             match op {
+                // Matching ops
                 CigarOp::Match | CigarOp::Diff | CigarOp::Equal => {
                     for _ in 0..l {
-                        if let Some((_, b, p)) = meth_itr.next() {
-                            let (i, c) = ref_itr.next().expect("Bad CIGAR");
-                            if let Some((m, rev)) = p.and_then(|(x, rev)| {
-                                if x >= thresh {
+                        // Get next base from read along with any modification if present.
+                        // If None is returned from meth_itr.next() then there are no more
+                        // modifications present for this record.
+                        if let Some((_, _, p)) = meth_itr.next() {
+                            let (i, _) = ref_itr.next().expect("Bad CIGAR");
+                            if let Some((m, rev)) = p.and_then(|(x_m, x_h, rev)| {
+                                if x_m >= thresh {
+                                    Some((2, rev))
+                                } else if x_h >= thresh {
+                                    Some((3, rev))
+                                } else if x_m + x_h >= thresh {
                                     Some((1, rev))
-                                } else if x <= thresh1 {
+                                } else if x_m + x_h <= thresh1 {
                                     Some((0, rev))
                                 } else {
                                     None
@@ -229,6 +250,7 @@ fn process_record(
                             }) {
                                 // XOR
                                 let r = (read_rev || rev) && !(read_rev && rev);
+
                                 if let Some(z) = if r {
                                     if i > 0 {
                                         Some(i + delta_x - 1)
@@ -240,10 +262,14 @@ fn process_record(
                                 } {
                                     if let Some(ct) = cb.find_site(z as u32, r) {
                                         ct[m] += 1;
+                                        if m >= 2 {
+                                            ct[1] += 1;
+                                        }
                                     }
                                 }
                             }
                         } else {
+                            // No more modified positions for this record
                             break;
                         }
                     }
@@ -284,7 +310,7 @@ fn read_thread(
         .set_selection(&["C+m", "C+h"])
         .expect("Problem setting modification selection");
 
-    for mut proc_blk in block_recv.iter() {
+    for proc_blk in block_recv.iter() {
         let ProcessBlock {
             idx,
             end_pos,
@@ -361,7 +387,7 @@ fn process_brec_block(
 /// Counts from completed blocks will be sent to the output thread which will assemble them and
 /// output the Bedmethyl file. Finished blocks of BamRecs will be sent back to the main thread so
 /// that they can be reused.
-pub fn read_input(cfg: &Config, rf: &Reference, mm_parse: &mut MMParse) -> anyhow::Result<()> {
+pub fn read_input(cfg: &Config, rf: &Reference) -> anyhow::Result<()> {
     debug!("Processing input");
     let mut hts_file =
         HtsFile::open(cfg.input_file(), HtsMode::Read).with_context(|| "Error opening input")?;
@@ -380,7 +406,7 @@ pub fn read_input(cfg: &Config, rf: &Reference, mm_parse: &mut MMParse) -> anyho
         ctg_names.push(s.to_str()?.to_owned())
     }
 
-    // Set number of process threads so we have 1-2 hts threads per proc thread
+    // Set number of process threads, so we have 1-2 hts threads per proc thread
     let n_proc = (cfg.threads() + 1) / 2;
 
     // Create list of blocks to hold records
@@ -446,9 +472,9 @@ pub fn read_input(cfg: &Config, rf: &Reference, mm_parse: &mut MMParse) -> anyho
                 break true;
             }
 
-            // Get an empty BRecBlock to fill.  If None is returned than an error occurred so we abort
+            // Get an empty BRecBlock to fill.  If None is returned than an error occurred, so we abort
             let Some(mut blk) = get_b_rec_block(&mut b_rec_blocks, &used_recv) else {
-                break true
+                break true;
             };
 
             // Fill BRecBlock with BamRec records from input stream
@@ -511,7 +537,7 @@ fn fill_b_rec_block(
     let res = loop {
         // Get next available BamRec or terminate normally
         let Some(rec) = blk.next_rec() else {
-            break false
+            break false;
         };
 
         // Read BamRec.
@@ -577,7 +603,7 @@ fn _get_block(
     b_rec_blocks: &mut Vec<BRecBlock>,
     r: &Receiver<BRecBlock>,
 ) -> anyhow::Result<BRecBlock> {
-    // Non blocking recovery of used BRecBlocks from r
+    // Non-blocking recovery of used BRecBlocks from r
     try_recover_used_blocks(b_rec_blocks, r)?;
 
     loop {
