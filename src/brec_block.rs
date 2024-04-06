@@ -7,7 +7,7 @@ use rs_htslib::sam::BamRec;
 /// element.  If ix == brec_vec.len() then the block is full and nothing can be added
 ///
 
-const BREC_BLOCK_SIZE: usize = 1024;
+const BREC_BLOCK_SIZE: usize = 256;
 
 pub(super) struct BRecBlock {
     ix: usize,

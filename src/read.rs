@@ -20,6 +20,7 @@ use super::{brec_block::*, config::Config, output, reference::Reference};
 ///   1 - 5mC or 5hmC
 ///   2 - 5mC
 ///   3 - 5hmC
+#[derive(Copy, Clone)]
 pub(super) struct CpG {
     pub(super) offset: u32,
     pub(super) fwd_counts: [u32; 4],
@@ -36,7 +37,10 @@ impl CpG {
     }
 
     fn add_counts(&mut self, other: &Self) {
-        for (p1, p2) in self.fwd_counts.iter_mut().zip(self.rev_counts.iter()) {
+        for (p1, p2) in self.fwd_counts.iter_mut().zip(other.fwd_counts.iter()) {
+            *p1 += *p2
+        }
+        for (p1, p2) in self.rev_counts.iter_mut().zip(other.rev_counts.iter()) {
             *p1 += *p2
         }
     }

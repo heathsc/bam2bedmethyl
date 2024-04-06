@@ -3,13 +3,15 @@ use std::{
     collections::HashMap,
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
+    thread::{self, Scope},
 };
 
 use compress_io::{
     compress::{CompressIo, Writer},
     compress_type::{CompressThreads, CompressType},
 };
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 
 use super::{
     config::Config,
@@ -32,7 +34,7 @@ fn make_output_stream(path: &Path, ct: CompressType) -> anyhow::Result<Writer> {
         .with_context(|| "Could not open output file/stream")
 }
 
-fn open_writers(cfg: &Config) -> anyhow::Result<[Writer; 3]> {
+fn open_writers(cfg: &Config) -> anyhow::Result<[Option<Writer>; 3]> {
     let ct = if cfg.compress() {
         CompressType::Bgzip
     } else {
@@ -42,10 +44,33 @@ fn open_writers(cfg: &Config) -> anyhow::Result<[Writer; 3]> {
     let output_paths = make_output_paths(cfg.output_prefix());
 
     Ok([
-        make_output_stream(&output_paths[0], ct)?,
-        make_output_stream(&output_paths[1], ct)?,
-        make_output_stream(&output_paths[2], ct)?,
+        Some(make_output_stream(&output_paths[0], ct)?),
+        Some(make_output_stream(&output_paths[1], ct)?),
+        Some(make_output_stream(&output_paths[2], ct)?),
     ])
+}
+
+const OUTPUT_BLOCK_SIZE: usize = 8192;
+
+struct OutputBlock {
+    start: usize,
+    tid: usize,
+    cpgs: Vec<CpG>,
+}
+
+impl OutputBlock {
+    fn init(start: usize, tid: usize) -> Self {
+        Self {
+            start,
+            tid,
+            cpgs: Vec::with_capacity(OUTPUT_BLOCK_SIZE),
+        }
+    }
+
+    fn add_cpg(&mut self, cpg: CpG) -> bool {
+        self.cpgs.push(cpg);
+        self.cpgs.len() >= OUTPUT_BLOCK_SIZE
+    }
 }
 
 pub(super) fn output_thread(
@@ -55,47 +80,194 @@ pub(super) fn output_thread(
 ) -> anyhow::Result<()> {
     debug!("Output thread starting up");
 
-    let mut wrt = open_writers(cfg)?;
+    let wrt = open_writers(cfg)?;
 
-    // Index of next block for output
-    let mut idx = 0;
+    // Get channels for output blocks
+    let (block_send, block_recv) = unbounded();
 
-    // Current block being output
-    let mut curr_blk: Option<CountBlock> = None;
+    thread::scope(|s| {
+        // Spawn output block thread (Combined)
+        let jh = s.spawn(|| output_block_thread(s, wrt, ctg_names, block_recv));
 
-    // Map containing blocks that arrived out of order
-    let mut pending = HashMap::new();
+        // Index of next block for output
+        let mut idx = 0;
 
-    for blk in r.iter() {
-        trace!("Output thread received block {}", blk.idx);
+        // Current block being output
+        let mut curr_blk: Option<CountBlock> = None;
+        let mut out_blk: Option<OutputBlock> = None;
 
-        // Check if this is the block we are looking for
-        if blk.idx == idx {
-            output_block(&mut wrt, blk, &mut curr_blk, ctg_names)?;
-            idx += 1;
-            // Check if we have the next blocks() in the pending hash
-            idx = output_pending(&mut wrt, &mut pending, idx, &mut curr_blk, ctg_names)?;
-        } else {
-            // Block has w=arrived out of order, so add to pending
-            pending.insert(blk.idx, blk);
+        // Map containing blocks that arrived out of order
+        let mut pending = HashMap::new();
+
+        for blk in r.iter() {
+            trace!("Output thread received block {}", blk.idx);
+
+            // Check if this is the block we are looking for
+            if blk.idx == idx {
+                process_block(blk, &mut curr_blk, &mut out_blk, &block_send, ctg_names)?;
+                idx += 1;
+                // Check if we have the next blocks() in the pending hash
+                while let Some(blk) = pending.remove(&idx) {
+                    process_block(blk, &mut curr_blk, &mut out_blk, &block_send, ctg_names)?;
+                    idx += 1;
+                }
+            } else {
+                // Block has w=arrived out of order, so add to pending
+                pending.insert(blk.idx, blk);
+            }
+        }
+        drop(block_send);
+        debug!("Output thread shutting down");
+        jh.join().expect("Error joining output_block_thread")
+    })
+}
+
+fn output_block_thread<'a>(
+    s: &'a Scope<'a, '_>,
+    mut wrt: [Option<Writer>; 3],
+    ctg_names: &'a [String],
+    r: Receiver<OutputBlock>,
+) -> anyhow::Result<()> {
+    debug!("Output block thread starting up");
+
+    let mut jh = Vec::with_capacity(3);
+    let mut chan = Vec::with_capacity(3);
+
+    for (ix, w1) in wrt.iter_mut().enumerate() {
+        let (snd, rcv) = unbounded();
+        chan.push(snd);
+        let w = w1.take().unwrap();
+        jh.push(s.spawn(move || cpg_writer_thread(w, ctg_names, rcv, ix)))
+    }
+
+    for ob in r.iter() {
+        let ob = Arc::new(ob);
+        for c in chan.iter() {
+            let ob_clone = ob.clone();
+            c.send(ob_clone)
+                .expect("Error sending block to cpg writer threads")
         }
     }
 
-    debug!("Output thread shutting down");
+    drop(chan);
+    debug!("Output block thread shutting down");
+    for j in jh.drain(..) {
+        j.join().expect("Error joining cpg writer threads")?
+    }
     Ok(())
 }
 
-fn output_block(
-    wrt: &mut [Writer; 3],
+fn cpg_writer_thread(
+    w: Writer,
+    ctg_names: &[String],
+    r: Receiver<Arc<OutputBlock>>,
+    ix: usize,
+) -> anyhow::Result<()> {
+    debug!("Cpg writer thread {ix} starting up");
+
+    match ix {
+        0 => write_cpg_blocks(w, ctg_names, r, |c| {
+            (
+                [c.fwd_counts[1], c.fwd_counts[0]],
+                [c.rev_counts[1], c.rev_counts[0]],
+                "5mC+5hmC",
+            )
+        })?,
+        1 => write_cpg_blocks(w, ctg_names, r, |c| {
+            (
+                [c.fwd_counts[2], c.fwd_counts[0] + c.fwd_counts[3]],
+                [c.rev_counts[2], c.rev_counts[0] + c.rev_counts[3]],
+                "5mC",
+            )
+        })?,
+        2 => write_cpg_blocks(w, ctg_names, r, |c| {
+            (
+                [c.fwd_counts[3], c.fwd_counts[0] + c.fwd_counts[2]],
+                [c.rev_counts[3], c.rev_counts[0] + c.rev_counts[2]],
+                "5hmC",
+            )
+        })?,
+        _ => panic!("Illegal options"),
+    }
+    debug!("Cpg writer thread {ix} shutting down");
+    Ok(())
+}
+
+fn write_cpg_blocks<F: Fn(&CpG) -> ([u32; 2], [u32; 2], &str)>(
+    mut w: Writer,
+    ctg_names: &[String],
+    r: Receiver<Arc<OutputBlock>>,
+    f: F,
+) -> anyhow::Result<()> {
+    for ob in r.iter() {
+        let start = ob.start;
+        let ctg = ctg_names[ob.tid].as_str();
+        for c in ob.cpgs.iter() {
+            write_cpg(&mut w, start, ctg, c, &f)?
+        }
+    }
+    Ok(())
+}
+
+fn write_cpg<F: Fn(&CpG) -> ([u32; 2], [u32; 2], &str)>(
+    w: &mut Writer,
+    start: usize,
+    ctg: &str,
+    c: &CpG,
+    f: F,
+) -> anyhow::Result<()> {
+    let (forward, reverse, desc) = f(c);
+    if forward[0] + forward[1] + reverse[0] + reverse[1] > 0 {
+        let pos = (c.offset as usize) + start;
+
+        let s1 = format!("{}\t{}", pos, pos + 1);
+        let s2 = format!("{ctg}\t{s1}\t\"{desc}\"");
+
+        let fm = |ct: [u32; 2]| -> (u32, f64) {
+            let cov = ct[0] + ct[1];
+            let m = if cov > 0 {
+                (ct[0] as f64) / (cov as f64)
+            } else {
+                0.0
+            };
+            (cov, m)
+        };
+
+        let (cov, m) = fm(forward);
+        writeln!(
+            w,
+            "{s2}\t{}\t+\t{s1}\t{}\t{cov}\t{:.2}",
+            cov.min(1000),
+            RGB_TAB[(m * 10.0 + 0.5) as usize],
+            100.0 * m
+        )
+        .with_context(|| "Error writing to bed file")?;
+        let (cov, m) = fm(reverse);
+        writeln!(
+            w,
+            "{s2}\t{}\t-\t{s1}\t{}\t{cov}\t{:.2}",
+            cov.min(1000),
+            RGB_TAB[(m * 10.0 + 0.5) as usize],
+            100.0 * m
+        )
+        .with_context(|| "Error writing to bed file")
+    } else {
+        Ok(())
+    }
+}
+
+fn process_block(
     mut blk: CountBlock,
     curr_blk: &mut Option<CountBlock>,
+    out_blk: &mut Option<OutputBlock>,
+    snd: &Sender<OutputBlock>,
     ctg_names: &[String],
 ) -> anyhow::Result<()> {
-    trace!("Output thread outputting block {}", blk.idx);
+    trace!("Output thread processing block {}", blk.idx);
 
     if let Some(mut prev_blk) = curr_blk.take() {
         if prev_blk.tid != blk.tid {
-            flush_block(wrt, &prev_blk, ctg_names[prev_blk.tid].as_str())?;
+            flush_block(&prev_blk, out_blk, snd)?;
             debug!("Started output of {}", ctg_names[blk.tid]);
         } else {
             assert!(blk.start >= prev_blk.start);
@@ -104,12 +276,13 @@ fn output_block(
             } else {
                 let delta = (blk.start - prev_blk.start) as u32;
                 let first_x = blk.cpg_sites[0].offset + delta;
-                write_partial_block(wrt, &prev_blk, first_x, ctg_names[prev_blk.tid].as_str())?;
+                write_partial_block(&prev_blk, out_blk, first_x, snd)?;
                 blk.add_counts(&mut prev_blk);
             }
         }
     } else {
         debug!("Started output of {}", ctg_names[blk.tid]);
+        *out_blk = Some(OutputBlock::init(blk.start, blk.tid))
     }
     *curr_blk = Some(blk);
     Ok(())
@@ -129,90 +302,39 @@ const RGB_TAB: [&str; 11] = [
     "255,0,0",
 ];
 
-fn write_bed_entry(
-    wrt: &mut Writer,
-    ctg: &str,
-    pos: usize,
-    strand: char,
-    ct_mod: u32,
-    ct_nmod: u32,
+fn flush_block(
+    blk: &CountBlock,
+    out_blk: &mut Option<OutputBlock>,
+    snd: &Sender<OutputBlock>,
 ) -> anyhow::Result<()> {
-    let cov = ct_nmod + ct_mod;
-    let m = if cov > 0 {
-        (ct_mod as f64) / (cov as f64)
-    } else {
-        0.0
-    };
-    writeln!(
-        wrt,
-        "{}\t{}\t{}\t\".\"\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}",
-        ctg,
-        pos,
-        pos + 1,
-        cov.min(1000),
-        strand,
-        pos,
-        pos + 1,
-        RGB_TAB[(m * 10.0 + 0.5) as usize],
-        cov,
-        100.0 * m
-    )
-    .with_context(|| "Error writing output")
-}
+    let mut ob = out_blk.take().expect("out_blk empty!");
 
-fn write_bed_line(
-    wrt: &mut [Writer; 3],
-    ctg: &str,
-    pos: usize,
-    strand: char,
-    cts: &[u32],
-) -> anyhow::Result<()> {
-    write_bed_entry(&mut wrt[0], ctg, pos, strand, cts[1], cts[0])?;
-    write_bed_entry(&mut wrt[1], ctg, pos, strand, cts[2], cts[3] + cts[0])?;
-    write_bed_entry(&mut wrt[2], ctg, pos, strand, cts[3], cts[2] + cts[0])
-}
-
-fn write_cpg_entry(wrt: &mut [Writer; 3], c: &CpG, start: usize, ctg: &str) -> anyhow::Result<()> {
-    if c.fwd_counts[0] + c.fwd_counts[1] + c.rev_counts[0] + c.rev_counts[1] > 0 {
-        let pos = (c.offset as usize) + start;
-        write_bed_line(wrt, ctg, pos, '+', &c.fwd_counts)?;
-        write_bed_line(wrt, ctg, pos + 1, '-', &c.rev_counts)?;
-    }
-    Ok(())
-}
-
-fn flush_block(wrt: &mut [Writer; 3], blk: &CountBlock, ctg: &str) -> anyhow::Result<()> {
     for c in blk.cpg_sites.iter() {
-        write_cpg_entry(wrt, c, blk.start, ctg)?
+        if ob.add_cpg(*c) {
+            snd.send(ob).with_context(|| "Error sending output block")?;
+            ob = OutputBlock::init(blk.start, blk.tid)
+        }
     }
+    *out_blk = Some(ob);
     Ok(())
 }
 
 fn write_partial_block(
-    wrt: &mut [Writer; 3],
     blk: &CountBlock,
+    out_blk: &mut Option<OutputBlock>,
     first_x: u32,
-    ctg: &str,
+    snd: &Sender<OutputBlock>,
 ) -> anyhow::Result<()> {
+    let mut ob = out_blk.take().expect("out_blk empty!");
     for c in blk.cpg_sites.iter() {
         if c.offset >= first_x {
             break;
         }
-        write_cpg_entry(wrt, c, blk.start, ctg)?
+        if ob.add_cpg(*c) {
+            snd.send(ob).with_context(|| "Error sending output block")?;
+            ob = OutputBlock::init(blk.start, blk.tid)
+        }
     }
+    *out_blk = Some(ob);
     Ok(())
-}
-
-fn output_pending(
-    wrt: &mut [Writer; 3],
-    pending: &mut HashMap<usize, CountBlock>,
-    mut idx: usize,
-    curr_blk: &mut Option<CountBlock>,
-    ctg_names: &[String],
-) -> anyhow::Result<usize> {
-    while let Some(blk) = pending.remove(&idx) {
-        output_block(wrt, blk, curr_blk, ctg_names)?;
-        idx += 1;
-    }
-    Ok(idx)
 }
