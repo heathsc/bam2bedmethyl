@@ -11,7 +11,7 @@ use compress_io::{
     compress::{CompressIo, Writer},
     compress_type::{CompressThreads, CompressType},
 };
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 
 use super::{
     config::Config,
@@ -29,7 +29,7 @@ fn make_output_stream(path: &Path, ct: CompressType) -> anyhow::Result<Writer> {
     CompressIo::new()
         .path(path)
         .ctype(ct)
-        .cthreads(CompressThreads::NPhysCores)
+        .cthreads(CompressThreads::Set(2))
         .writer()
         .with_context(|| "Could not open output file/stream")
 }
@@ -67,7 +67,8 @@ impl OutputBlock {
         }
     }
 
-    fn add_cpg(&mut self, cpg: CpG) -> bool {
+    fn add_cpg(&mut self, mut cpg: CpG, delta: u32) -> bool {
+        cpg.offset += delta;
         self.cpgs.push(cpg);
         self.cpgs.len() >= OUTPUT_BLOCK_SIZE
     }
@@ -83,7 +84,7 @@ pub(super) fn output_thread(
     let wrt = open_writers(cfg)?;
 
     // Get channels for output blocks
-    let (block_send, block_recv) = unbounded();
+    let (block_send, block_recv) = bounded(6);
 
     thread::scope(|s| {
         // Spawn output block thread (Combined)
@@ -116,6 +117,9 @@ pub(super) fn output_thread(
                 pending.insert(blk.idx, blk);
             }
         }
+        if let Some(cblk) = curr_blk.take() {
+            flush_block_and_send(&cblk, &mut out_blk, &block_send)?
+        }
         drop(block_send);
         debug!("Output thread shutting down");
         jh.join().expect("Error joining output_block_thread")
@@ -134,7 +138,7 @@ fn output_block_thread<'a>(
     let mut chan = Vec::with_capacity(3);
 
     for (ix, w1) in wrt.iter_mut().enumerate() {
-        let (snd, rcv) = unbounded();
+        let (snd, rcv) = bounded(2);
         chan.push(snd);
         let w = w1.take().unwrap();
         jh.push(s.spawn(move || cpg_writer_thread(w, ctg_names, rcv, ix)))
@@ -267,7 +271,7 @@ fn process_block(
 
     if let Some(mut prev_blk) = curr_blk.take() {
         if prev_blk.tid != blk.tid {
-            flush_block(&prev_blk, out_blk, snd)?;
+            flush_block_and_send(&prev_blk, out_blk, snd)?;
             debug!("Started output of {}", ctg_names[blk.tid]);
         } else {
             assert!(blk.start >= prev_blk.start);
@@ -282,7 +286,6 @@ fn process_block(
         }
     } else {
         debug!("Started output of {}", ctg_names[blk.tid]);
-        *out_blk = Some(OutputBlock::init(blk.start, blk.tid))
     }
     *curr_blk = Some(blk);
     Ok(())
@@ -302,37 +305,42 @@ const RGB_TAB: [&str; 11] = [
     "255,0,0",
 ];
 
-fn flush_block(
+fn flush_block_and_send(
     blk: &CountBlock,
     out_blk: &mut Option<OutputBlock>,
     snd: &Sender<OutputBlock>,
 ) -> anyhow::Result<()> {
-    let mut ob = out_blk.take().expect("out_blk empty!");
-
+    let (mut ob, delta) = if let Some(ob) = out_blk.take() {
+        let delta = (blk.start - ob.start) as u32;
+        (ob, delta)
+    } else {
+        (OutputBlock::init(blk.start, blk.tid), 0)
+    };
     for c in blk.cpg_sites.iter() {
-        if ob.add_cpg(*c) {
-            snd.send(ob).with_context(|| "Error sending output block")?;
-            ob = OutputBlock::init(blk.start, blk.tid)
-        }
+        ob.add_cpg(*c, delta);
     }
-    *out_blk = Some(ob);
-    Ok(())
+    snd.send(ob).with_context(|| "Error sending output block")
 }
-
 fn write_partial_block(
     blk: &CountBlock,
     out_blk: &mut Option<OutputBlock>,
     first_x: u32,
     snd: &Sender<OutputBlock>,
 ) -> anyhow::Result<()> {
-    let mut ob = out_blk.take().expect("out_blk empty!");
+    let (mut ob, mut delta) = if let Some(ob) = out_blk.take() {
+        let delta = (blk.start - ob.start) as u32;
+        (ob, delta)
+    } else {
+        (OutputBlock::init(blk.start, blk.tid), 0)
+    };
     for c in blk.cpg_sites.iter() {
         if c.offset >= first_x {
             break;
         }
-        if ob.add_cpg(*c) {
+        if ob.add_cpg(*c, delta) {
             snd.send(ob).with_context(|| "Error sending output block")?;
-            ob = OutputBlock::init(blk.start, blk.tid)
+            ob = OutputBlock::init(blk.start, blk.tid);
+            delta = 0;
         }
     }
     *out_blk = Some(ob);
