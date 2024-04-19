@@ -224,9 +224,6 @@ fn write_cpg<F: Fn(&CpG) -> ([u32; 2], [u32; 2], &str)>(
     if forward[0] + forward[1] + reverse[0] + reverse[1] > 0 {
         let pos = (c.offset as usize) + start;
 
-        let s1 = format!("{}\t{}", pos, pos + 1);
-        let s2 = format!("{ctg}\t{s1}\t\"{desc}\"");
-
         let fm = |ct: [u32; 2]| -> (u32, f64) {
             let cov = ct[0] + ct[1];
             let m = if cov > 0 {
@@ -238,18 +235,20 @@ fn write_cpg<F: Fn(&CpG) -> ([u32; 2], [u32; 2], &str)>(
         };
 
         let (cov, m) = fm(forward);
+        let s1 = format!("{}\t{}", pos, pos + 1);
         writeln!(
             w,
-            "{s2}\t{}\t+\t{s1}\t{}\t{cov}\t{:.2}",
+            "{ctg}\t{s1}\t\"{desc}\"\t{}\t-\t{s1}\t{}\t{cov}\t{:.2}",
             cov.min(1000),
             RGB_TAB[(m * 10.0 + 0.5) as usize],
             100.0 * m
         )
         .with_context(|| "Error writing to bed file")?;
         let (cov, m) = fm(reverse);
+        let s1 = format!("{}\t{}", pos + 1, pos + 2);
         writeln!(
             w,
-            "{s2}\t{}\t-\t{s1}\t{}\t{cov}\t{:.2}",
+            "{ctg}\t{s1}\t\"{desc}\"\t{}\t-\t{s1}\t{}\t{cov}\t{:.2}",
             cov.min(1000),
             RGB_TAB[(m * 10.0 + 0.5) as usize],
             100.0 * m
