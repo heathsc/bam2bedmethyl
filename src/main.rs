@@ -3,10 +3,11 @@ extern crate anyhow;
 #[macro_use]
 extern crate log;
 
-mod brec_block;
 mod cli;
 mod config;
+mod count_block;
 mod output;
+mod process_read;
 mod read;
 mod reference;
 mod utils;

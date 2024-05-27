@@ -15,8 +15,10 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 
 use super::{
     config::Config,
-    read::{CountBlock, CpG},
+    count_block::{CountBlock, CpG},
 };
+
+use crate::read::pileup::PileupEntry;
 
 fn make_output_paths(prefix: &str) -> [PathBuf; 3] {
     let path_combined = PathBuf::from(format!("{prefix}_cpg.bed"));
@@ -34,19 +36,31 @@ fn make_output_stream(path: &Path, ct: CompressType) -> anyhow::Result<Writer> {
         .with_context(|| "Could not open output file/stream")
 }
 
-fn open_writers(cfg: &Config) -> anyhow::Result<[Option<Writer>; 3]> {
+fn open_writers(cfg: &Config) -> anyhow::Result<[Option<Writer>; 4]> {
     let ct = if cfg.compress() {
         CompressType::Bgzip
     } else {
         CompressType::NoFilter
     };
 
-    let output_paths = make_output_paths(cfg.output_prefix());
+    let prefix = cfg.output_prefix();
+
+    let output_paths = make_output_paths(prefix);
+
+    let pileup_output = if cfg.pileup() {
+        Some(make_output_stream(
+            &PathBuf::from(format!("{prefix}_pipeline.tsv")),
+            ct,
+        )?)
+    } else {
+        None
+    };
 
     Ok([
         Some(make_output_stream(&output_paths[0], ct)?),
         Some(make_output_stream(&output_paths[1], ct)?),
         Some(make_output_stream(&output_paths[2], ct)?),
+        pileup_output,
     ])
 }
 
@@ -68,7 +82,7 @@ impl OutputBlock {
     }
 
     fn add_cpg(&mut self, mut cpg: CpG, delta: u32) -> bool {
-        cpg.offset += delta;
+        cpg.add_offset(delta);
         self.cpgs.push(cpg);
         self.cpgs.len() >= OUTPUT_BLOCK_SIZE
     }
@@ -101,10 +115,10 @@ pub(super) fn output_thread(
         let mut pending = HashMap::new();
 
         for blk in r.iter() {
-            trace!("Output thread received block {}", blk.idx);
+            trace!("Output thread received block {}", blk.idx());
 
             // Check if this is the block we are looking for
-            if blk.idx == idx {
+            if blk.idx() == idx {
                 process_block(blk, &mut curr_blk, &mut out_blk, &block_send, ctg_names)?;
                 idx += 1;
                 // Check if we have the next blocks() in the pending hash
@@ -114,11 +128,11 @@ pub(super) fn output_thread(
                 }
             } else {
                 // Block has w=arrived out of order, so add to pending
-                pending.insert(blk.idx, blk);
+                pending.insert(blk.idx(), blk);
             }
         }
         if let Some(cblk) = curr_blk.take() {
-            flush_block_and_send(&cblk, &mut out_blk, &block_send)?
+            flush_block_and_send(cblk, &mut out_blk, &block_send)?
         }
         drop(block_send);
         debug!("Output thread shutting down");
@@ -128,20 +142,24 @@ pub(super) fn output_thread(
 
 fn output_block_thread<'a>(
     s: &'a Scope<'a, '_>,
-    mut wrt: [Option<Writer>; 3],
+    mut wrt: [Option<Writer>; 4],
     ctg_names: &'a [String],
     r: Receiver<OutputBlock>,
 ) -> anyhow::Result<()> {
     debug!("Output block thread starting up");
 
-    let mut jh = Vec::with_capacity(3);
-    let mut chan = Vec::with_capacity(3);
+    let mut jh = Vec::with_capacity(4);
+    let mut chan = Vec::with_capacity(4);
 
     for (ix, w1) in wrt.iter_mut().enumerate() {
         let (snd, rcv) = bounded(2);
         chan.push(snd);
-        let w = w1.take().unwrap();
-        jh.push(s.spawn(move || cpg_writer_thread(w, ctg_names, rcv, ix)))
+        if ix < 3 {
+            let w = w1.take().unwrap();
+            jh.push(s.spawn(move || cpg_writer_thread(w, ctg_names, rcv, ix)))
+        } else if let Some(w) = w1.take() {
+            jh.push(s.spawn(move || pileup_writer_thread(w, ctg_names, rcv)))
+        }
     }
 
     for ob in r.iter() {
@@ -172,22 +190,22 @@ fn cpg_writer_thread(
     match ix {
         0 => write_cpg_blocks(w, ctg_names, r, |c| {
             (
-                [c.fwd_counts[1], c.fwd_counts[0]],
-                [c.rev_counts[1], c.rev_counts[0]],
+                [c.fwd_counts()[1], c.fwd_counts()[0]],
+                [c.rev_counts()[1], c.rev_counts()[0]],
                 "5mC+5hmC",
             )
         })?,
         1 => write_cpg_blocks(w, ctg_names, r, |c| {
             (
-                [c.fwd_counts[2], c.fwd_counts[0] + c.fwd_counts[3]],
-                [c.rev_counts[2], c.rev_counts[0] + c.rev_counts[3]],
+                [c.fwd_counts()[2], c.fwd_counts()[0] + c.fwd_counts()[3]],
+                [c.rev_counts()[2], c.rev_counts()[0] + c.rev_counts()[3]],
                 "5mC",
             )
         })?,
         2 => write_cpg_blocks(w, ctg_names, r, |c| {
             (
-                [c.fwd_counts[3], c.fwd_counts[0] + c.fwd_counts[2]],
-                [c.rev_counts[3], c.rev_counts[0] + c.rev_counts[2]],
+                [c.fwd_counts()[3], c.fwd_counts()[0] + c.fwd_counts()[2]],
+                [c.rev_counts()[3], c.rev_counts()[0] + c.rev_counts()[2]],
                 "5hmC",
             )
         })?,
@@ -222,7 +240,7 @@ fn write_cpg<F: Fn(&CpG) -> ([u32; 2], [u32; 2], &str)>(
 ) -> anyhow::Result<()> {
     let (forward, reverse, desc) = f(c);
     if forward[0] + forward[1] + reverse[0] + reverse[1] > 0 {
-        let pos = (c.offset as usize) + start;
+        let pos = (c.offset() as usize) + start;
 
         let fm = |ct: [u32; 2]| -> (u32, f64) {
             let cov = ct[0] + ct[1];
@@ -259,6 +277,59 @@ fn write_cpg<F: Fn(&CpG) -> ([u32; 2], [u32; 2], &str)>(
     }
 }
 
+fn pileup_writer_thread(
+    mut w: Writer,
+    ctg_names: &[String],
+    r: Receiver<Arc<OutputBlock>>,
+) -> anyhow::Result<()> {
+    debug!("Pileup writer thread starting up");
+
+    for ob in r.iter() {
+        let start = ob.start;
+        let ctg = ctg_names[ob.tid].as_str();
+        for c in ob.cpgs.iter() {
+            write_pileup(&mut w, start, ctg, c)?
+        }
+    }
+    debug!("Pileup writer thread shutting down");
+    Ok(())
+}
+
+fn write_pileup(w: &mut Writer, start: usize, ctg: &str, c: &CpG) -> anyhow::Result<()> {
+    const ERR_STR: &str = "Error writing to pileup file";
+    if let Some(v) = c.pileup() {
+        let mut cts: [u32; 8] = [0; 8];
+        for e in v.iter() {
+            if let Some(ix) = match e {
+                PileupEntry::CytosineFwd => Some(0),
+                PileupEntry::MethCytosineFwd => Some(1),
+                PileupEntry::HydroxyMethCytosineFwd => Some(2),
+                PileupEntry::TotalMethFwd => Some(3),
+                PileupEntry::CytosineRev => Some(4),
+                PileupEntry::MethCytosineRev => Some(5),
+                PileupEntry::HydroxyMethCytosineRev => Some(6),
+                PileupEntry::TotalMethRev => Some(7),
+                _ => None,
+            } {
+                cts[ix] += 1
+            }
+        }
+
+        if cts.iter().sum::<u32>() > 0 {
+            let pos = (c.offset() as usize) + start + 1;
+            write!(w, "{ctg}\t{pos}\t",).with_context(|| ERR_STR)?;
+            for x in cts.iter() {
+                write!(w, "{}\t", x).with_context(|| ERR_STR)?;
+            }
+            for e in v.iter() {
+                write!(w, "{e}").with_context(|| ERR_STR)?;
+            }
+            writeln!(w).with_context(|| ERR_STR)?;
+        }
+    }
+    Ok(())
+}
+
 fn process_block(
     mut blk: CountBlock,
     curr_blk: &mut Option<CountBlock>,
@@ -266,25 +337,25 @@ fn process_block(
     snd: &Sender<OutputBlock>,
     ctg_names: &[String],
 ) -> anyhow::Result<()> {
-    trace!("Output thread processing block {}", blk.idx);
+    trace!("Output thread processing block {}", blk.idx());
 
     if let Some(mut prev_blk) = curr_blk.take() {
-        if prev_blk.tid != blk.tid {
-            flush_block_and_send(&prev_blk, out_blk, snd)?;
-            debug!("Started output of {}", ctg_names[blk.tid]);
+        if prev_blk.tid() != blk.tid() {
+            flush_block_and_send(prev_blk, out_blk, snd)?;
+            debug!("Started output of {}", ctg_names[blk.tid()]);
         } else {
-            assert!(blk.start >= prev_blk.start);
-            if blk.cpg_sites.is_empty() {
+            assert!(blk.start() >= prev_blk.start());
+            if blk.cpg_sites().is_empty() {
                 blk = prev_blk
             } else {
-                let delta = (blk.start - prev_blk.start) as u32;
-                let first_x = blk.cpg_sites[0].offset + delta;
-                write_partial_block(&prev_blk, out_blk, first_x, snd)?;
+                let delta = (blk.start() - prev_blk.start()) as u32;
+                let first_x = blk.cpg_sites()[0].offset() + delta;
+                write_partial_block(&mut prev_blk, out_blk, first_x, snd)?;
                 blk.add_counts(&mut prev_blk);
             }
         }
     } else {
-        debug!("Started output of {}", ctg_names[blk.tid]);
+        debug!("Started output of {}", ctg_names[blk.tid()]);
     }
     *curr_blk = Some(blk);
     Ok(())
@@ -304,41 +375,50 @@ const RGB_TAB: [&str; 11] = [
     "255,0,0",
 ];
 
-fn flush_block_and_send(
+fn get_ouput_block_and_delta(
+    out_blk: &mut Option<OutputBlock>,
     blk: &CountBlock,
+) -> (OutputBlock, u32) {
+    if let Some(ob) = out_blk.take() {
+        let delta = (blk.start() - ob.start) as u32;
+        (ob, delta)
+    } else {
+        (OutputBlock::init(blk.start(), blk.tid()), 0)
+    }
+}
+
+fn flush_block_and_send(
+    mut blk: CountBlock,
     out_blk: &mut Option<OutputBlock>,
     snd: &Sender<OutputBlock>,
 ) -> anyhow::Result<()> {
-    let (mut ob, delta) = if let Some(ob) = out_blk.take() {
-        let delta = (blk.start - ob.start) as u32;
-        (ob, delta)
-    } else {
-        (OutputBlock::init(blk.start, blk.tid), 0)
-    };
-    for c in blk.cpg_sites.iter() {
-        ob.add_cpg(*c, delta);
+    let (mut ob, delta) = get_ouput_block_and_delta(out_blk, &blk);
+
+    for c in blk.cpg_sites_mut().drain(..) {
+        ob.add_cpg(c, delta);
     }
     snd.send(ob).with_context(|| "Error sending output block")
 }
+
 fn write_partial_block(
-    blk: &CountBlock,
+    blk: &mut CountBlock,
     out_blk: &mut Option<OutputBlock>,
     first_x: u32,
     snd: &Sender<OutputBlock>,
 ) -> anyhow::Result<()> {
-    let (mut ob, mut delta) = if let Some(ob) = out_blk.take() {
-        let delta = (blk.start - ob.start) as u32;
-        (ob, delta)
-    } else {
-        (OutputBlock::init(blk.start, blk.tid), 0)
-    };
-    for c in blk.cpg_sites.iter() {
-        if c.offset >= first_x {
-            break;
-        }
-        if ob.add_cpg(*c, delta) {
+    let (mut ob, mut delta) = get_ouput_block_and_delta(out_blk, blk);
+
+    let i = blk
+        .cpg_sites()
+        .binary_search_by_key(&first_x, |c| c.offset())
+        .unwrap_or_else(|i| i);
+    let (st, tid) = (blk.start(), blk.tid());
+
+    for c in blk.cpg_sites_mut().drain(..i) {
+        assert!(c.offset() < first_x);
+        if ob.add_cpg(c, delta) {
             snd.send(ob).with_context(|| "Error sending output block")?;
-            ob = OutputBlock::init(blk.start, blk.tid);
+            ob = OutputBlock::init(st, tid);
             delta = 0;
         }
     }

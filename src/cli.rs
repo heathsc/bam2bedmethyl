@@ -95,6 +95,13 @@ pub fn cli_model() -> Command {
                 .help("Prefix for output files"),
         )
         .arg(
+            Arg::new("pileup")
+                .action(ArgAction::SetTrue)
+                .short('P')
+                .long("pileup")
+                .help("Generate methylation pileup)"),
+        )
+        .arg(
             Arg::new("compress")
                 .action(ArgAction::SetTrue)
                 .short('z')

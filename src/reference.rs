@@ -101,10 +101,20 @@ impl<'a> FastaFile<'a> {
             .read_sequence()
             .with_context(|| format!("Error reading sequence for contig {}", name))?;
 
-        debug!("Read {}, length {}", &name, seq.len());
+        trace!("Finding CpGs for {}", name);
+        let cpgs = find_cpgs(&seq, 0);
+        debug!(
+            "Read {}, length {}, no. CpGs {}",
+            &name,
+            seq.len(),
+            cpgs.len(),
+        );
+
         Ok(Some(RefContig {
             name,
             seq: RefSeq::Vec(seq),
+            cpgs,
+            start: 0,
         }))
     }
 
@@ -172,6 +182,9 @@ impl Reference {
     pub fn get_seq(&self, ctg: &str, x: usize, y: usize) -> Option<&[u8]> {
         self.contig_seq.get(ctg).and_then(|c| c.seq(x, y))
     }
+    pub fn get_cpgs(&self, ctg: &str) -> Option<&[u64]> {
+        self.contig_seq.get(ctg).map(|c| c.cpgs())
+    }
 
     fn add_contig(&mut self, ref_ctg: RefContig) -> anyhow::Result<()> {
         let ctg = ref_ctg.name.clone();
@@ -187,7 +200,9 @@ impl Reference {
 
 pub struct RefContig {
     name: Arc<str>,
+    cpgs: Vec<u64>, // Offsets from contig start to reference CpG positions
     seq: RefSeq,
+    start: usize,
 }
 
 impl RefContig {
@@ -196,7 +211,15 @@ impl RefContig {
     }
 
     pub fn seq(&self, x: usize, y: usize) -> Option<&[u8]> {
-        self.seq.seq(x, y)
+        self.seq.seq(x, y, self.start())
+    }
+
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    pub fn cpgs(&self) -> &[u64] {
+        &self.cpgs
     }
 }
 
@@ -206,20 +229,34 @@ pub enum RefSeq {
 }
 
 impl RefSeq {
-    pub fn seq(&self, x: usize, y: usize) -> Option<&[u8]> {
-        match self {
-            Self::Vec(v) => {
-                assert!(x <= y);
-                if x < v.len() {
-                    let y = (y + 1).min(v.len());
-                    Some(&v[x..y])
-                } else {
-                    None
-                }
-            }
-            Self::Seq(s) => s.get_seq(x + 1, y + 1).ok(),
+    pub fn seq(&self, x: usize, y: usize, start: usize) -> Option<&[u8]> {
+        assert!(x <= y && x >= start, "Illegal sequence coordinates");
+        // Get reference slice
+        let v = match self {
+            Self::Vec(v) => v,
+            Self::Seq(s) => s.seq(),
+        };
+        let l = v.len();
+        let x1 = x - start;
+        if x1 < l {
+            let y1 = (y + 1 - start).min(l);
+            Some(&v[x1..y1])
+        } else {
+            None
         }
     }
+}
+
+fn find_cpgs(v: &[u8], start: usize) -> Vec<u64> {
+    let mut x = start as u64;
+    let mut cpgs = Vec::new();
+    for p in v.windows(2) {
+        if p[0].to_ascii_uppercase() == b'C' && p[1].to_ascii_uppercase() == b'G' {
+            cpgs.push(x);
+        }
+        x += 1;
+    }
+    cpgs
 }
 
 /// Try to load faidx index for reference file
@@ -262,11 +299,22 @@ fn faidx_load_thread(
 
         let name = Arc::from(ctg.to_str()?);
 
-        debug!("({}) Read sequence {}, length {}", ix, name, seq.len());
+        trace!("Finding CpGs for {}", name);
+        let start = seq.start() - 1;
+        let cpgs = find_cpgs(seq.seq(), start);
+        debug!(
+            "({}) Read sequence {}, length {}, no. CpGs {}",
+            ix,
+            name,
+            seq.len(),
+            cpgs.len(),
+        );
 
         reference.add_contig(RefContig {
             name,
             seq: RefSeq::Seq(seq),
+            start,
+            cpgs,
         })?
     }
     debug!("Reference read thread {} shutting down", ix);

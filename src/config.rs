@@ -15,7 +15,10 @@ pub struct Config {
     input_file: Option<PathBuf>,
     // Output file prefix - if not, set to bam2bedmethyl
     output_prefix: String,
+    // Compress output using bgzip
     compress: bool,
+    // Generate methylation pileup
+    pileup: bool,
     // Path to fasta file (possibly compressed) with reference sequence
     ref_file: PathBuf,
     // Down sampling - select proportion of reads that are discarded.  Must be in 0.0...=1.0
@@ -39,6 +42,9 @@ impl Config {
     }
     pub fn compress(&self) -> bool {
         self.compress
+    }
+    pub fn pileup(&self) -> bool {
+        self.pileup
     }
     pub fn ref_file(&self) -> &Path {
         &self.ref_file.as_path()
@@ -117,6 +123,7 @@ pub fn handle_cli() -> anyhow::Result<Config> {
     };
 
     let compress = m.get_flag("compress");
+    let pileup = m.get_flag("pileup");
     let output_prefix = m
         .get_one::<String>("output")
         .map(|p| p.to_owned())
@@ -127,6 +134,7 @@ pub fn handle_cli() -> anyhow::Result<Config> {
         output_prefix,
         ref_file,
         compress,
+        pileup,
         discard,
         seed,
         mapq_threshold,
