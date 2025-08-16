@@ -66,9 +66,10 @@ impl Pileup {
 }
 
 #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
-pub(crate) enum PileupEntry {
+pub(crate) enum PileupCode {
     #[default]
     NotPresent = 0,
+    Missing,
     CytosineFwd,
     MethCytosineFwd,
     HydroxyMethCytosineFwd,
@@ -81,10 +82,58 @@ pub(crate) enum PileupEntry {
     UncalledRev,
 }
 
-const PE_OUTPUT: [char; 11] = [' ', 'C', 'M', 'H', 'T', '.', 'c', 'm', 'h', 't', ','];
+const PE_OUTPUT: [char; 12] = [' ', '-', 'C', 'M', 'H', 'T', '.', 'c', 'm', 'h', 't', ','];
+
+impl fmt::Display for PileupCode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", PE_OUTPUT[*self as usize])
+    }
+}
+
+#[derive(Debug, Default, Copy, Clone)]
+pub(crate) struct PileupEntry {
+    code: PileupCode,
+    prob_mc: u8, // Probability coded as 0-255 on a linear scale with 255 = 1.0 and  0 = 0.0
+    prob_hmc: u8,
+}
 
 impl fmt::Display for PileupEntry {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", PE_OUTPUT[*self as usize])
+        write!(f, "{}", PE_OUTPUT[self.code as usize])?;
+        if matches!(self.code, PileupCode::NotPresent | PileupCode::Missing) {
+            write!(f, "    ")
+        } else {
+            write!(f, "{:02x}{:02x}", self.prob_mc, self.prob_hmc)
+        }
+    }
+}
+
+impl PileupEntry {
+    #[inline]
+    pub(crate) fn new(code: PileupCode, prob_mc: u8, prob_hmc: u8) -> Self {
+        Self {
+            code,
+            prob_mc,
+            prob_hmc,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn new_missing() -> Self {
+        Self {
+            code: PileupCode::Missing,
+            prob_hmc: 0,
+            prob_mc: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn code(&self) -> PileupCode {
+        self.code
+    }
+
+    #[inline]
+    pub(crate) fn is_present(&self) -> bool {
+        !matches!(self.code, PileupCode::NotPresent)
     }
 }

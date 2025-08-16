@@ -1,22 +1,25 @@
+pub mod count_block;
 mod meth_itr;
 pub mod process_block;
 
 use crossbeam_channel::{Receiver, Sender};
 
-use rs_htslib::sam::{parse_mod_tags, BamRec, CigarOp, MMParse};
+use rs_htslib::sam::{BamRec, CigarOp, MMParse, parse_mod_tags};
 
 use super::{
     config::Config,
-    count_block::CountBlock,
-    read::{pileup::PileupEntry, read_record::ReadRec},
+    read::{
+        pileup::{PileupCode, PileupEntry},
+        read_record::ReadRec,
+    },
     reference::Reference,
 };
 
 use crate::read::brec_block::*;
 
-use process_block::ProcessBlock;
-
+use count_block::CountBlock;
 use meth_itr::MethItr;
+use process_block::ProcessBlock;
 
 fn get_read_coords(rec: &BamRec) -> anyhow::Result<(usize, usize)> {
     let tid = rec.tid().ok_or(anyhow!("Missing tid for BAM record"))?;
@@ -25,15 +28,15 @@ fn get_read_coords(rec: &BamRec) -> anyhow::Result<(usize, usize)> {
     Ok((tid, x))
 }
 
-const PILEUP_ITEMS: [PileupEntry; 8] = [
-    PileupEntry::CytosineFwd,
-    PileupEntry::TotalMethFwd,
-    PileupEntry::MethCytosineFwd,
-    PileupEntry::HydroxyMethCytosineFwd,
-    PileupEntry::CytosineRev,
-    PileupEntry::TotalMethRev,
-    PileupEntry::MethCytosineRev,
-    PileupEntry::HydroxyMethCytosineRev,
+const PILEUP_ITEMS: [PileupCode; 8] = [
+    PileupCode::CytosineFwd,
+    PileupCode::TotalMethFwd,
+    PileupCode::MethCytosineFwd,
+    PileupCode::HydroxyMethCytosineFwd,
+    PileupCode::CytosineRev,
+    PileupCode::TotalMethRev,
+    PileupCode::MethCytosineRev,
+    PileupCode::HydroxyMethCytosineRev,
 ];
 
 fn process_record(
@@ -48,6 +51,8 @@ fn process_record(
     let rec = rrec.brec();
     // Find and parse MM/ML tags from record
     if let Some(tags) = parse_mod_tags(rec, mm_parse)? {
+        let mut cts: [u32; 4] = [0; 4];
+
         // Tags found.  Make iterator over modified positions
         let mod_iter = mm_parse.mk_pos_iter(rec, &tags)?;
         let mut meth_itr = MethItr::new(mod_iter);
@@ -82,7 +87,7 @@ fn process_record(
 
         // Setup pileup counts if required
         if let Some(ix) = pileup_ix {
-            cb.init_pileup_index(ix, x, y, read_rev)
+            cb.init_pileup_index(ix, x, y)
         }
 
         // Iterate through cigar ops
@@ -104,39 +109,54 @@ fn process_record(
                         // modifications present for this record.
                         if let Some((_, _, p)) = meth_itr.next() {
                             let (i, _) = ref_itr.next().expect("Bad CIGAR");
-                            if let Some((m, rev)) = p.and_then(|(x_m, x_h, rev)| {
+                            if let Some((om, x_m, x_h, rev)) = p.map(|(x_m, x_h, rev)| {
                                 if x_m >= thresh {
-                                    Some((2, rev))
+                                    (Some(2), x_m, x_h, rev)
                                 } else if x_h >= thresh {
-                                    Some((3, rev))
+                                    (Some(3), x_m, x_h, rev)
                                 } else if x_m + x_h >= thresh {
-                                    Some((1, rev))
+                                    (Some(1), x_m, x_h, rev)
                                 } else if x_m + x_h <= thresh1 {
-                                    Some((0, rev))
+                                    (Some(0), x_m, x_h, rev)
                                 } else {
-                                    None
+                                    (None, x_m, x_h, rev)
                                 }
                             }) {
                                 // XOR
                                 let r = (read_rev || rev) && !(read_rev && rev);
 
                                 if let Some(z) = if r {
-                                    if i > 0 {
-                                        Some(i + delta_x - 1)
-                                    } else {
-                                        None
-                                    }
+                                    if i > 0 { Some(i + delta_x - 1) } else { None }
                                 } else {
                                     Some(i + delta_x)
-                                } {
-                                    if let Some(cpg) = cb.find_site(z as u32) {
+                                } && let Some(cpg) = cb.find_site(z as u32)
+                                {
+                                    if let Some(m) = om {
+                                        cts[m] += 1;
                                         cpg.incr_count(m, r);
                                         if let Some(k) = pileup_ix {
                                             cpg.add_to_pileup(
                                                 k,
-                                                PILEUP_ITEMS[if r { m + 4 } else { m }],
+                                                PileupEntry::new(
+                                                    PILEUP_ITEMS[if r { m + 4 } else { m }],
+                                                    x_m,
+                                                    x_h,
+                                                ),
                                             )
                                         }
+                                    } else if let Some(k) = pileup_ix {
+                                        cpg.add_to_pileup(
+                                            k,
+                                            PileupEntry::new(
+                                                if r {
+                                                    PileupCode::UncalledRev
+                                                } else {
+                                                    PileupCode::UncalledFwd
+                                                },
+                                                x_m,
+                                                x_h,
+                                            ),
+                                        )
                                     }
                                 }
                             }
@@ -175,7 +195,7 @@ pub(super) fn process_read_thread(
     block_recv: Receiver<ProcessBlock>,
     block_send: Sender<BRecBlock>,
 ) -> anyhow::Result<()> {
-    debug!("prcoess read thread {} starting up", ix);
+    debug!("process read thread {} starting up", ix);
 
     let mut mm_parse = MMParse::default();
     mm_parse

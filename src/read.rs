@@ -63,7 +63,7 @@ pub fn read_input(cfg: &Config, rf: &Reference) -> anyhow::Result<()> {
     }
 
     // Set number of process threads, so we have 1-2 hts threads per proc thread
-    let n_proc = (cfg.threads() + 1) / 2;
+    let n_proc = cfg.threads().div_ceil(2);
 
     // Create list of blocks to hold records
     // We create enough so that each process thread and the output thread can have 1 block being
@@ -196,6 +196,7 @@ pub fn read_input(cfg: &Config, rf: &Reference) -> anyhow::Result<()> {
 
 /// Fill BRecBlock blk with BamRec read from hts. Returns an indicator of end-of-stream
 /// or an error if any error occurred while reading
+#[allow(clippy::too_many_arguments)]
 fn fill_b_rec_block(
     cfg: &Config,
     rdr: &mut SamReader,

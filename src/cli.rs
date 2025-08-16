@@ -73,7 +73,7 @@ pub fn cli_model() -> Command {
                 .long("min-prob")
                 .value_parser(value_parser!(f64))
                 .value_name("PROB (0.5-1)")
-                .default_value("0.75")
+                .default_value("0.8")
                 .help("Minimum prob. to call a methylation value"),
         )
         .arg(

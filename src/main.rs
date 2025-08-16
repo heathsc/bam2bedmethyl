@@ -5,7 +5,6 @@ extern crate log;
 
 mod cli;
 mod config;
-mod count_block;
 mod output;
 mod process_read;
 mod read;

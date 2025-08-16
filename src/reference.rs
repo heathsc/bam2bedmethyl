@@ -251,7 +251,7 @@ fn find_cpgs(v: &[u8], start: usize) -> Vec<u64> {
     let mut x = start as u64;
     let mut cpgs = Vec::new();
     for p in v.windows(2) {
-        if p[0].to_ascii_uppercase() == b'C' && p[1].to_ascii_uppercase() == b'G' {
+        if p[0].eq_ignore_ascii_case(&b'C') && p[1].eq_ignore_ascii_case(&b'G') {
             cpgs.push(x);
         }
         x += 1;

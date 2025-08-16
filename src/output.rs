@@ -15,10 +15,10 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 
 use super::{
     config::Config,
-    count_block::{CountBlock, CpG},
+    process_read::count_block::{CountBlock, CpG},
 };
 
-use crate::read::pileup::PileupEntry;
+use crate::read::pileup::PileupCode;
 
 fn make_output_paths(prefix: &str) -> [PathBuf; 3] {
     let path_combined = PathBuf::from(format!("{prefix}_cpg.bed"));
@@ -31,7 +31,7 @@ fn make_output_stream(path: &Path, ct: CompressType) -> anyhow::Result<Writer> {
     CompressIo::new()
         .path(path)
         .ctype(ct)
-        .cthreads(CompressThreads::Set(2))
+        .cthreads(CompressThreads::Set(4))
         .writer()
         .with_context(|| "Could not open output file/stream")
 }
@@ -152,12 +152,14 @@ fn output_block_thread<'a>(
     let mut chan = Vec::with_capacity(4);
 
     for (ix, w1) in wrt.iter_mut().enumerate() {
-        let (snd, rcv) = bounded(2);
-        chan.push(snd);
         if ix < 3 {
+            let (snd, rcv) = bounded(2);
+            chan.push(snd);
             let w = w1.take().unwrap();
             jh.push(s.spawn(move || cpg_writer_thread(w, ctg_names, rcv, ix)))
         } else if let Some(w) = w1.take() {
+            let (snd, rcv) = bounded(2);
+            chan.push(snd);
             jh.push(s.spawn(move || pileup_writer_thread(w, ctg_names, rcv)))
         }
     }
@@ -300,15 +302,15 @@ fn write_pileup(w: &mut Writer, start: usize, ctg: &str, c: &CpG) -> anyhow::Res
     if let Some(v) = c.pileup() {
         let mut cts: [u32; 8] = [0; 8];
         for e in v.iter() {
-            if let Some(ix) = match e {
-                PileupEntry::CytosineFwd => Some(0),
-                PileupEntry::MethCytosineFwd => Some(1),
-                PileupEntry::HydroxyMethCytosineFwd => Some(2),
-                PileupEntry::TotalMethFwd => Some(3),
-                PileupEntry::CytosineRev => Some(4),
-                PileupEntry::MethCytosineRev => Some(5),
-                PileupEntry::HydroxyMethCytosineRev => Some(6),
-                PileupEntry::TotalMethRev => Some(7),
+            if let Some(ix) = match e.code() {
+                PileupCode::CytosineFwd => Some(0),
+                PileupCode::MethCytosineFwd => Some(1),
+                PileupCode::HydroxyMethCytosineFwd => Some(2),
+                PileupCode::TotalMethFwd => Some(3),
+                PileupCode::CytosineRev => Some(4),
+                PileupCode::MethCytosineRev => Some(5),
+                PileupCode::HydroxyMethCytosineRev => Some(6),
+                PileupCode::TotalMethRev => Some(7),
                 _ => None,
             } {
                 cts[ix] += 1

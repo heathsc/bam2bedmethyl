@@ -7,8 +7,6 @@ use super::read_record::ReadRec;
 ///
 /// brec_vec is always fully populated with BamRec, and ix is the index of the next available
 /// element.  If ix == brec_vec.len() then the block is full and nothing can be added
-///
-
 const BREC_BLOCK_SIZE: usize = 256;
 
 pub struct BRecBlock {
@@ -40,11 +38,11 @@ impl BRecBlock {
         self.ix = 0
     }
 
-    pub(super) fn next_rec(
-        &mut self,
+    pub(super) fn next_rec<'a>(
+        &'a mut self,
         rdr: &mut SamReader,
-        pending: &mut Option<ReadRec>,
-    ) -> anyhow::Result<BrecFill> {
+        pending: &'a mut Option<ReadRec>,
+    ) -> anyhow::Result<BrecFill<'a>> {
         Ok(match self.read_rec_vec.get_mut(self.ix) {
             Some(b) => {
                 if let Some(r) = pending.take() {

@@ -47,7 +47,7 @@ impl Config {
         self.pileup
     }
     pub fn ref_file(&self) -> &Path {
-        &self.ref_file.as_path()
+        self.ref_file.as_path()
     }
     pub fn discard(&self) -> f64 {
         self.discard
@@ -105,7 +105,7 @@ pub fn handle_cli() -> anyhow::Result<Config> {
         .expect("Missing default value");
 
     let prob_threshold = match m.get_one::<f64>("min_prob").expect("Missing default value") {
-        x if (0.5..=1.0).contains(x) => Ok((x * 256.0).round().min(255.0) as u8),
+        x if (0.5..=1.0).contains(x) => Ok((x * 256.0 - 0.5).round().min(255.0) as u8),
         x => Err(anyhow!("meth probability option {} not in range 0.5-1", x)),
     }?;
 
@@ -113,7 +113,7 @@ pub fn handle_cli() -> anyhow::Result<Config> {
     let threads = m
         .get_one::<NonZeroUsize>("threads")
         .map(|i| usize::from(*i))
-        .unwrap_or_else(|| num_cpus::get());
+        .unwrap_or_else(num_cpus::get);
 
     // If multiple treads requested, set up HtsThreadPool
     let hts_thread_pool = if threads > 1 {

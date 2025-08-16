@@ -18,7 +18,7 @@ impl CountBlock {
 
         // Go through reference to find CpG sites
         for (i, c) in rf.windows(2).enumerate() {
-            if c[0].to_ascii_uppercase() == b'C' && c[1].to_ascii_uppercase() == b'G' {
+            if c[0].eq_ignore_ascii_case(&b'C') && c[1].eq_ignore_ascii_case(&b'G') {
                 cpg_sites.push(CpG::new(i as u32, gen_pileup))
             }
         }
@@ -31,7 +31,7 @@ impl CountBlock {
         }
     }
 
-    pub(crate) fn init_pileup_index(&mut self, ix: usize, x: usize, y: usize, reverse: bool) {
+    pub(crate) fn init_pileup_index(&mut self, ix: usize, x: usize, y: usize) {
         assert!(x >= self.start && y >= x, "Illegal read coordinates");
         let x1 = x - self.start;
         let y1 = y - self.start;
@@ -45,7 +45,7 @@ impl CountBlock {
             .map(|i| i + 1)
             .unwrap_or_else(|i| i);
         for c in self.cpg_sites[i..j].iter_mut() {
-            c.reserve_pileup(ix, reverse)
+            c.reserve_pileup(ix)
         }
     }
 
@@ -119,7 +119,7 @@ impl CountBlock {
 ///   1 - 5mC or 5hmC
 ///   2 - 5mC
 ///   3 - 5hmC
-pub(super) struct CpG {
+pub(crate) struct CpG {
     offset: u32,
     fwd_counts: [u32; 4],
     rev_counts: [u32; 4],
@@ -138,7 +138,7 @@ impl CpG {
     }
 
     #[inline]
-    pub(super) fn incr_count(&mut self, m: usize, reverse: bool) {
+    pub(crate) fn incr_count(&mut self, m: usize, reverse: bool) {
         let ct = if reverse {
             &mut self.rev_counts
         } else {
@@ -151,8 +151,8 @@ impl CpG {
     }
 
     #[inline]
-    pub(super) fn add_to_pileup(&mut self, ix: usize, m: PileupEntry) {
-        self.pileup.as_mut().expect("Missing pileup")[ix] = m;
+    pub(crate) fn add_to_pileup(&mut self, ix: usize, e: PileupEntry) {
+        self.pileup.as_mut().expect("Missing pileup")[ix] = e;
     }
 
     #[inline]
@@ -173,10 +173,9 @@ impl CpG {
                 v1.resize(v2.len(), PileupEntry::default())
             }
             for (p1, p2) in v1.iter_mut().zip(v2.iter()) {
-                match (*p1, *p2) {
-                    (_, PileupEntry::NotPresent) => {}
-                    (PileupEntry::NotPresent, e) => *p1 = e,
-                    _ => panic!("Clash when merging pileups"),
+                if p2.is_present() {
+                    assert!(!p1.is_present(), "Clash when merging pileups");
+                    *p1 = *p2
                 }
             }
         } else {
@@ -184,14 +183,10 @@ impl CpG {
         }
     }
 
-    fn reserve_pileup(&mut self, ix: usize, reverse: bool) {
+    fn reserve_pileup(&mut self, ix: usize) {
         let v = self.pileup.as_mut().expect("Missing pileup vector");
 
-        let uncalled = if reverse {
-            PileupEntry::UncalledRev
-        } else {
-            PileupEntry::UncalledFwd
-        };
+        let uncalled = PileupEntry::new_missing();
 
         if v.len() < ix + 1 {
             v.resize(ix + 1, PileupEntry::default())
@@ -200,27 +195,27 @@ impl CpG {
     }
 
     #[inline]
-    pub(super) fn add_offset(&mut self, delta: u32) {
+    pub(crate) fn add_offset(&mut self, delta: u32) {
         self.offset += delta
     }
 
     #[inline]
-    pub(super) fn fwd_counts(&self) -> &[u32; 4] {
+    pub(crate) fn fwd_counts(&self) -> &[u32; 4] {
         &self.fwd_counts
     }
 
     #[inline]
-    pub(super) fn rev_counts(&self) -> &[u32; 4] {
+    pub(crate) fn rev_counts(&self) -> &[u32; 4] {
         &self.rev_counts
     }
 
     #[inline]
-    pub(super) fn offset(&self) -> u32 {
+    pub(crate) fn offset(&self) -> u32 {
         self.offset
     }
 
     #[inline]
-    pub(super) fn pileup(&self) -> Option<&[PileupEntry]> {
+    pub(crate) fn pileup(&self) -> Option<&[PileupEntry]> {
         self.pileup.as_deref()
     }
 }
