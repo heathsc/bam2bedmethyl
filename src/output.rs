@@ -11,7 +11,7 @@ use compress_io::{
     compress::{CompressIo, Writer},
     compress_type::{CompressThreads, CompressType},
 };
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use super::{
     config::Config,
@@ -20,11 +20,12 @@ use super::{
 
 use crate::read::pileup::PileupCode;
 
-fn make_output_paths(prefix: &str) -> [PathBuf; 3] {
+fn make_output_paths(prefix: &str) -> [PathBuf; 4] {
     let path_combined = PathBuf::from(format!("{prefix}_cpg.bed"));
     let path_meth = PathBuf::from(format!("{prefix}_5mC_cpg.bed"));
     let path_hmeth = PathBuf::from(format!("{prefix}_5hmC_cpg.bed"));
-    [path_combined, path_meth, path_hmeth]
+    let path_hm_frac = PathBuf::from(format!("{prefix}_hm_frac_cpg.bed"));
+    [path_combined, path_meth, path_hmeth, path_hm_frac]
 }
 
 fn make_output_stream(path: &Path, ct: CompressType) -> anyhow::Result<Writer> {
@@ -36,7 +37,7 @@ fn make_output_stream(path: &Path, ct: CompressType) -> anyhow::Result<Writer> {
         .with_context(|| "Could not open output file/stream")
 }
 
-fn open_writers(cfg: &Config) -> anyhow::Result<[Option<Writer>; 4]> {
+fn open_writers(cfg: &Config) -> anyhow::Result<[Option<Writer>; 5]> {
     let ct = if cfg.compress() {
         CompressType::Bgzip
     } else {
@@ -60,6 +61,7 @@ fn open_writers(cfg: &Config) -> anyhow::Result<[Option<Writer>; 4]> {
         Some(make_output_stream(&output_paths[0], ct)?),
         Some(make_output_stream(&output_paths[1], ct)?),
         Some(make_output_stream(&output_paths[2], ct)?),
+        Some(make_output_stream(&output_paths[3], ct)?),
         pileup_output,
     ])
 }
@@ -142,7 +144,7 @@ pub(super) fn output_thread(
 
 fn output_block_thread<'a>(
     s: &'a Scope<'a, '_>,
-    mut wrt: [Option<Writer>; 4],
+    mut wrt: [Option<Writer>; 5],
     ctg_names: &'a [String],
     r: Receiver<OutputBlock>,
 ) -> anyhow::Result<()> {
@@ -152,7 +154,7 @@ fn output_block_thread<'a>(
     let mut chan = Vec::with_capacity(4);
 
     for (ix, w1) in wrt.iter_mut().enumerate() {
-        if ix < 3 {
+        if ix < 4 {
             let (snd, rcv) = bounded(2);
             chan.push(snd);
             let w = w1.take().unwrap();
@@ -209,6 +211,13 @@ fn cpg_writer_thread(
                 [c.fwd_counts()[3], c.fwd_counts()[0] + c.fwd_counts()[2]],
                 [c.rev_counts()[3], c.rev_counts()[0] + c.rev_counts()[2]],
                 "5hmC",
+            )
+        })?,
+        3 => write_cpg_blocks(w, ctg_names, r, |c| {
+            (
+                [c.fwd_counts()[3], c.fwd_counts()[2]],
+                [c.rev_counts()[3], c.rev_counts()[2]],
+                "5hmC/(5mC+5hmC)",
             )
         })?,
         _ => panic!("Illegal options"),
