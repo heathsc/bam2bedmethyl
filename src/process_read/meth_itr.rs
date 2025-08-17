@@ -17,7 +17,7 @@ impl<'a, 'b> MethItr<'a, 'b> {
     }
 }
 
-impl<'a, 'b> Iterator for MethItr<'a, 'b> {
+impl<'a, 'b: 'a> Iterator for MethItr<'a, 'b> {
     type Item = (usize, SeqBase, Option<(u8, u8, bool)>);
 
     fn next(&mut self) -> Option<Self::Item> {
