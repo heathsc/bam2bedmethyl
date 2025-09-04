@@ -19,6 +19,8 @@ pub struct Config {
     compress: bool,
     // Generate methylation pileup
     pileup: bool,
+    // Gemerate output for non-cpg contexts
+    non_cpg: bool,
     // Path to fasta file (possibly compressed) with reference sequence
     ref_file: PathBuf,
     // Down sampling - select proportion of reads that are discarded.  Must be in 0.0...=1.0
@@ -45,6 +47,9 @@ impl Config {
     }
     pub fn pileup(&self) -> bool {
         self.pileup
+    }
+    pub fn non_cpg(&self) -> bool {
+        self.non_cpg
     }
     pub fn ref_file(&self) -> &Path {
         self.ref_file.as_path()
@@ -124,6 +129,7 @@ pub fn handle_cli() -> anyhow::Result<Config> {
 
     let compress = m.get_flag("compress");
     let pileup = m.get_flag("pileup");
+    let non_cpg = m.get_flag("non_cpg");
     let output_prefix = m
         .get_one::<String>("output")
         .map(|p| p.to_owned())
@@ -135,6 +141,7 @@ pub fn handle_cli() -> anyhow::Result<Config> {
         ref_file,
         compress,
         pileup,
+        non_cpg,
         discard,
         seed,
         mapq_threshold,

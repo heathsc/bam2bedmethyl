@@ -1,4 +1,5 @@
 pub mod count_block;
+pub mod cytosine;
 mod meth_itr;
 pub mod process_block;
 
@@ -126,14 +127,18 @@ fn process_record(
                                 let r = (read_rev || rev) && !(read_rev && rev);
 
                                 if let Some(z) = if r {
-                                    if i > 0 { Some(i + delta_x - 1) } else { None }
+                                    if i + delta_x > 0 {
+                                        Some(i + delta_x - 1)
+                                    } else {
+                                        None
+                                    }
                                 } else {
                                     Some(i + delta_x)
-                                } && let Some(cpg) = cb.find_site(z as u32)
+                                } && let Some(cpg) = cb.find_site(z as u32, r)
                                 {
                                     if let Some(m) = om {
                                         cts[m] += 1;
-                                        cpg.incr_count(m, r);
+                                        cpg.incr_count(m);
                                         if let Some(k) = pileup_ix {
                                             cpg.add_to_pileup(
                                                 k,
@@ -242,6 +247,8 @@ fn process_brec_block(
     let recs = bblock.brec_vec();
     let (tid, start) = get_read_coords(recs[0].brec())?;
     assert!(start <= end_pos);
+    let (start, end_pos) = (start.saturating_sub(2), end_pos.saturating_add(2));
+    
     let rf = reference
         .get_seq(contigs[tid].as_str(), start, end_pos)
         .ok_or(anyhow!(
@@ -255,7 +262,7 @@ fn process_brec_block(
         start,
         end_pos,
     );
-    let mut cb = CountBlock::new(idx, tid, start, rf, cfg.pileup());
+    let mut cb = CountBlock::new(idx, tid, start, rf, cfg, 2);
 
     for rec in recs {
         process_record(cfg, rf, rec, mm_parse, &mut cb)?

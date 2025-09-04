@@ -102,6 +102,13 @@ pub fn cli_model() -> Command {
                 .help("Generate methylation pileup)"),
         )
         .arg(
+            Arg::new("non_cpg")
+                .action(ArgAction::SetTrue)
+                .short('n')
+                .long("non-cpg")
+                .help("Generate output for non-cpg as well as cpg contexts"),
+        )
+        .arg(
             Arg::new("compress")
                 .action(ArgAction::SetTrue)
                 .short('z')
