@@ -79,11 +79,6 @@ impl CountBlock {
 
         if non_cpg {
             c_sites.sort_unstable_by_key(|c| c.offset());
-            for c in c_sites.windows(2) {
-                if c[0].offset() == c[1].offset() {
-                    eprintln!("OOOOOK! {c:?}")
-                }
-            }
         }
 
         Self {
