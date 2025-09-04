@@ -55,8 +55,8 @@ impl WriterBlock {
     fn get_writer(&mut self, ctxt: CContext) -> Option<&mut Writer> {
         match ctxt {
             CContext::Cg => Some(&mut self.cpg),
-            CContext::Chg => self.chg.as_mut(),
-            CContext::Chh => self.chh.as_mut(),
+            CContext::Chg(_) => self.chg.as_mut(),
+            CContext::Chh(_,_) => self.chh.as_mut(),
         }
     }
 }
@@ -294,13 +294,13 @@ fn write_blocks<F: Fn(&Cytosine) -> [u32; 2]>(
         let start = ob.start;
         let ctg = ctg_names[ob.tid].as_str();
         for c in ob.cpgs.iter() {
-            write_cpg(w, start, ctg, desc, c, &f)?
+            write_cytosine(w, start, ctg, desc, c, &f)?
         }
     }
     Ok(())
 }
 
-fn write_cpg<F: Fn(&Cytosine) -> [u32; 2]>(
+fn write_cytosine<F: Fn(&Cytosine) -> [u32; 2]>(
     wb: &mut WriterBlock,
     start: usize,
     ctg: &str,
@@ -324,11 +324,12 @@ fn write_cpg<F: Fn(&Cytosine) -> [u32; 2]>(
         let s1 = format!("{}\t{}", pos, pos + 1);
         writeln!(
             w,
-            "{ctg}\t{s1}\t\"{desc}\"\t{}\t{}\t{s1}\t{}\t{cov}\t{:.4}",
+            "{ctg}\t{s1}\t\"{desc}\"\t{}\t{}\t{s1}\t{}\t{cov}\t{:.4}\t{}",
             cov.min(1000),
             c.strand(),
             RGB_TAB[(m * 10.0 + 0.5) as usize],
-            100.0 * m
+            100.0 * m,
+            c.context()
         )
         .with_context(|| "Error writing to bed file")
     } else {

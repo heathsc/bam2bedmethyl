@@ -2,24 +2,20 @@ use std::fmt;
 
 use crate::read::pileup::PileupEntry;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone)]
 pub enum CContext {
     Cg,
-    Chg,
-    Chh,
+    Chg(u8),
+    Chh(u8, u8),
 }
 
 impl fmt::Display for CContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::Cg => "CG",
-                Self::Chg => "CHG",
-                Self::Chh => "CHH",
-            }
-        )
+        match self {
+            Self::Cg => write!(f, "CG"),
+            Self::Chg(c) => write!(f, "C{}G", *c as char),
+            Self::Chh(c1,c2) => write!(f, "C{}{}", *c1 as char, *c2 as char),
+        }
     }
 }
 
@@ -126,12 +122,12 @@ impl Cytosine {
     pub(crate) fn counts(&self) -> &[u32; 4] {
         &self.counts
     }
-    
+
     #[inline]
     pub(crate) fn strand(&self) -> Strand {
         self.strand
     }
-    
+
     #[inline]
     pub(crate) fn context(&self) -> CContext {
         self.context
@@ -141,7 +137,7 @@ impl Cytosine {
     pub(crate) fn offset(&self) -> u32 {
         self.offset
     }
-    
+
     #[inline]
     pub(crate) fn set_offset(&mut self, x: u32) {
         self.offset = x

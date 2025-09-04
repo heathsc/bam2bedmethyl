@@ -126,16 +126,7 @@ fn process_record(
                                 // XOR
                                 let r = (read_rev || rev) && !(read_rev && rev);
 
-                                if let Some(z) = if r {
-                                    if i + delta_x > 0 {
-                                        Some(i + delta_x - 1)
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    Some(i + delta_x)
-                                } && let Some(cpg) = cb.find_site(z as u32, r)
-                                {
+                                if let Some(cpg) = cb.find_site((i + delta_x) as u32, r) {
                                     if let Some(m) = om {
                                         cts[m] += 1;
                                         cpg.incr_count(m);
@@ -248,7 +239,7 @@ fn process_brec_block(
     let (tid, start) = get_read_coords(recs[0].brec())?;
     assert!(start <= end_pos);
     let (start, end_pos) = (start.saturating_sub(2), end_pos.saturating_add(2));
-    
+
     let rf = reference
         .get_seq(contigs[tid].as_str(), start, end_pos)
         .ok_or(anyhow!(

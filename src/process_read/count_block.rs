@@ -35,6 +35,13 @@ impl CountBlock {
             }
         };
 
+        let compl = |c: u8| match c {
+            b'a' | b'A' => b'T',
+            b'c' | b'C' => b'G',
+            b'g' | b'G' => b'C',
+            b't' | b'T' => b'A',
+            x => x,
+        };
         // Go through reference to find C sites
         if non_cpg {
             for (i, c) in rf.windows(3).enumerate() {
@@ -43,21 +50,21 @@ impl CountBlock {
                         add_site(i, Strand::Forward, CContext::Cg, gen_pileup);
                         add_site(i + 1, Strand::Reverse, CContext::Cg, gen_pileup);
                         if c[2].eq_ignore_ascii_case(&b'G') {
-                            add_site(i + 2, Strand::Reverse, CContext::Chg, false)
+                            add_site(i + 2, Strand::Reverse, CContext::Chg(compl(c[1])), false)
                         }
                     } else if c[2].eq_ignore_ascii_case(&b'G') {
-                        add_site(i, Strand::Forward, CContext::Chg, false);
+                        add_site(i, Strand::Forward, CContext::Chg(c[1]), false);
                         if !c[1].eq_ignore_ascii_case(&b'C') {
-                            add_site(i + 2, Strand::Reverse, CContext::Chg, false)
+                            add_site(i + 2, Strand::Reverse, CContext::Chg(compl(c[1])), false)
                         }
                     } else {
-                        add_site(i, Strand::Forward, CContext::Chh, false)
+                        add_site(i, Strand::Forward, CContext::Chh(c[1], c[2]), false)
                     }
                 } else if c[2].eq_ignore_ascii_case(&b'G')
                     && !c[1].eq_ignore_ascii_case(&b'C')
                     && !c[0].eq_ignore_ascii_case(&b'C')
                 {
-                    add_site(i + 2, Strand::Reverse, CContext::Chh, false)
+                    add_site(i + 2, Strand::Reverse, CContext::Chh(compl(c[1]), compl(c[0])), false)
                 }
             }
         } else {
@@ -96,7 +103,7 @@ impl CountBlock {
             .binary_search_by_key(&x1, |c| c.offset() as usize)
             .unwrap_or_else(|i| i);
 
-        while self.c_sites[i].context() != CContext::Cg {
+        while !matches!(self.c_sites[i].context(), CContext::Cg) {
             if i > 0 {
                 i -= 1;
             } else {
@@ -113,7 +120,7 @@ impl CountBlock {
             .unwrap_or_else(|i| i);
 
         let l = self.c_sites.len();
-        while self.c_sites[j].context() != CContext::Cg {
+        while !matches!(self.c_sites[j].context(),CContext::Cg) {
             if j + 1 < l { j += 1 } else { break }
         }
         for c in self.c_sites[i..=j].iter_mut() {
