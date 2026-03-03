@@ -77,6 +77,13 @@ pub fn cli_model() -> Command {
                 .help("Minimum prob. to call a methylation value"),
         )
         .arg(
+            Arg::new("ignore_supplementary_alignments")
+                .action(ArgAction::SetTrue)
+                .short('I')
+                .long("ignore-supplementary-alignments")
+                .help("Do not use supplementary alignments"),
+        )
+        .arg(
             Arg::new("reference")
                 .short('T')
                 .long("reference")

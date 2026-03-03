@@ -1,7 +1,7 @@
 use std::thread::{self, ScopedJoinHandle};
 
 use anyhow::Context;
-use crossbeam_channel::{bounded, unbounded, Receiver, TryRecvError};
+use crossbeam_channel::{Receiver, TryRecvError, bounded, unbounded};
 use rand::{distributions::Uniform, prelude::*};
 use rand_pcg::Pcg64Mcg;
 
@@ -9,7 +9,7 @@ use brec_block::*;
 use rs_htslib::{
     hts::{HtsFile, HtsMode, HtsPos},
     sam::{
-        SamHeader, SamReader, BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP,
+        BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP, SamHeader, SamReader,
     },
 };
 
@@ -212,6 +212,14 @@ fn fill_b_rec_block(
 
     let mut curr: Option<(usize, HtsPos, &[u64])> = None;
 
+    let chk_flags = {
+        let x = BAM_FUNMAP | BAM_FDUP | BAM_FQCFAIL | BAM_FSECONDARY;
+        if cfg.ignore_supplementary_alignments() {
+            x | BAM_FSUPPLEMENTARY
+        } else {
+            x
+        }
+    };
     let res = loop {
         // Get next available BamRec or terminate normally
         let rec = match blk.next_rec(rdr, pending)? {
@@ -229,12 +237,7 @@ fn fill_b_rec_block(
         let br = rec.brec();
 
         // For reads that are not down sampled, we filter on the flags and on MAPQ
-        if discard
-            || br.flag_check_any(
-                BAM_FUNMAP | BAM_FDUP | BAM_FQCFAIL | BAM_FSECONDARY | BAM_FSUPPLEMENTARY,
-            )
-            || br.qual().unwrap() < cfg.mapq_threshold()
-        {
+        if discard || br.flag_check_any(chk_flags) || br.qual().unwrap() < cfg.mapq_threshold() {
             // remove discarded read from block
             blk.decr_ix();
         } else {

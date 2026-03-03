@@ -19,6 +19,8 @@ pub struct Config {
     compress: bool,
     // Generate methylation pileup
     pileup: bool,
+    // Ignore supplementart_alignments
+    ignore_suppl_align: bool,
     // Gemerate output for non-cpg contexts
     non_cpg: bool,
     // Path to fasta file (possibly compressed) with reference sequence
@@ -47,6 +49,9 @@ impl Config {
     }
     pub fn pileup(&self) -> bool {
         self.pileup
+    }
+    pub fn ignore_supplementary_alignments(&self) -> bool {
+        self.ignore_suppl_align
     }
     pub fn non_cpg(&self) -> bool {
         self.non_cpg
@@ -129,6 +134,7 @@ pub fn handle_cli() -> anyhow::Result<Config> {
 
     let compress = m.get_flag("compress");
     let pileup = m.get_flag("pileup");
+    let ignore_suppl_align = m.get_flag("ignore_supplementary_alignments");
     let non_cpg = m.get_flag("non_cpg");
     let output_prefix = m
         .get_one::<String>("output")
@@ -141,6 +147,7 @@ pub fn handle_cli() -> anyhow::Result<Config> {
         ref_file,
         compress,
         pileup,
+        ignore_suppl_align,
         non_cpg,
         discard,
         seed,
