@@ -1,6 +1,6 @@
-use rs_htslib::{hts::HtsRead, sam::SamReader};
+use m_htslib::{hts::ReadRec, sam::SamReader};
 
-use super::read_record::ReadRec;
+use super::read_record::ReadRecord;
 
 /// Storage for consecutive BAM records read from
 /// input file/stream
@@ -11,14 +11,14 @@ const BREC_BLOCK_SIZE: usize = 256;
 
 pub struct BRecBlock {
     ix: usize,
-    read_rec_vec: Vec<ReadRec>,
+    read_rec_vec: Vec<ReadRecord>,
 }
 
 impl Default for BRecBlock {
     fn default() -> Self {
         let mut brec_vec = Vec::with_capacity(BREC_BLOCK_SIZE);
         for _ in 0..BREC_BLOCK_SIZE {
-            brec_vec.push(ReadRec::new())
+            brec_vec.push(ReadRecord::new())
         }
         Self {
             ix: 0,
@@ -41,7 +41,7 @@ impl BRecBlock {
     pub(super) fn next_rec<'a>(
         &'a mut self,
         rdr: &mut SamReader,
-        pending: &'a mut Option<ReadRec>,
+        pending: &'a mut Option<ReadRecord>,
     ) -> anyhow::Result<BrecFill<'a>> {
         Ok(match self.read_rec_vec.get_mut(self.ix) {
             Some(b) => {
@@ -50,7 +50,7 @@ impl BRecBlock {
                     let _ = std::mem::replace(b, r);
                     self.ix += 1;
                     BrecFill::Rec(b)
-                } else if !rdr.read(b.brec_mut())? {
+                } else if rdr.read_rec(b.brec_mut())?.is_none() {
                     BrecFill::EndOfFile
                 } else {
                     self.ix += 1;
@@ -62,9 +62,9 @@ impl BRecBlock {
     }
 
     #[inline]
-    pub(super) fn push_back(&mut self) -> ReadRec {
+    pub(super) fn push_back(&mut self) -> ReadRecord {
         self.decr_ix();
-        let mut r = ReadRec::new();
+        let mut r = ReadRecord::new();
         std::mem::swap(&mut r, &mut self.read_rec_vec[self.ix]);
         r
     }
@@ -76,7 +76,7 @@ impl BRecBlock {
     }
 
     #[inline]
-    pub fn brec_vec(&mut self) -> &mut [ReadRec] {
+    pub fn brec_vec(&mut self) -> &mut [ReadRecord] {
         &mut self.read_rec_vec[..self.ix]
     }
 
@@ -87,7 +87,7 @@ impl BRecBlock {
 }
 
 pub(super) enum BrecFill<'a> {
-    Rec(&'a mut ReadRec),
+    Rec(&'a mut ReadRecord),
     EndOfBlock,
     EndOfFile,
 }

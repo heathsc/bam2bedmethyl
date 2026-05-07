@@ -1,4 +1,4 @@
-use std::thread::{self, ScopedJoinHandle};
+use std::{os::unix::ffi::OsStrExt, thread::{self, ScopedJoinHandle}};
 
 use anyhow::Context;
 use crossbeam_channel::{Receiver, TryRecvError, bounded, unbounded};
@@ -6,18 +6,18 @@ use rand::{distributions::Uniform, prelude::*};
 use rand_pcg::Pcg64Mcg;
 
 use brec_block::*;
-use rs_htslib::{
-    hts::{HtsFile, HtsMode, HtsPos},
-    sam::{
-        BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP, SamHeader, SamReader,
-    },
+use m_htslib::{
+    CStrWrap, hts::{HtsFile, HtsPos, IdMap}, sam::{
+        SamHdr, SamReader,
+        record::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP},
+    }
 };
 
 use super::{
     config::Config,
     output,
     process_read::{process_block::ProcessBlock, process_read_thread},
-    read::read_record::ReadRec,
+    read::read_record::ReadRecord,
     reference::Reference,
 };
 
@@ -45,20 +45,22 @@ use pileup::Pileup;
 /// that they can be reused.
 pub fn read_input(cfg: &Config, rf: &Reference) -> anyhow::Result<()> {
     debug!("Processing input");
+    let fname = cfg.input_file().map(|p| CStrWrap::from(p.as_os_str().as_bytes()))
+        .unwrap_or_else(|| CStrWrap::from(r"-"));
     let mut hts_file =
-        HtsFile::open(cfg.input_file(), HtsMode::Read).with_context(|| "Error opening input")?;
+        HtsFile::open(fname, "r").with_context(|| "Error opening input")?;
     trace!("Opened input successfully");
     if let Some(tpool) = cfg.hts_thread_pool() {
-        hts_file.attach_thread_pool(tpool)?;
+        hts_file.set_thread_pool(tpool)?;
     }
-    let hdr = SamHeader::read(&mut hts_file).with_context(|| "Error reading input header")?;
+    let hdr = SamHdr::read(&mut hts_file).with_context(|| "Error reading input header")?;
     trace!("Read in input header");
 
     // Collect contig names
-    let seq = hdr.sequences();
+    let seq = hdr.seq_iter();
     let mut ctg_names: Vec<_> = Vec::with_capacity(seq.size_hint().0);
 
-    for (s, _) in seq {
+    for s in seq {
         ctg_names.push(s.to_str()?.to_owned())
     }
 
@@ -85,7 +87,7 @@ pub fn read_input(cfg: &Config, rf: &Reference) -> anyhow::Result<()> {
     let (out_send, out_recv) = bounded(n_proc * 8);
 
     // Create reader
-    let mut rdr = SamReader::new(hts_file, hdr);
+    let mut rdr = SamReader::new(&mut hts_file, &hdr);
 
     // Create RNG for down sampling
     let mut rng = if cfg.discard() > 0.0 {
@@ -203,7 +205,7 @@ fn fill_b_rec_block(
     mut rng: Option<&mut Pcg64Mcg>,
     blk: &mut BRecBlock,
     mut pileup: Option<&mut Pileup>,
-    pending: &mut Option<ReadRec>,
+    pending: &mut Option<ReadRecord>,
     ctg_names: &[String],
     rf: &Reference,
 ) -> anyhow::Result<(bool, Option<usize>)> {
@@ -237,13 +239,13 @@ fn fill_b_rec_block(
         let br = rec.brec();
 
         // For reads that are not down sampled, we filter on the flags and on MAPQ
-        if discard || br.flag_check_any(chk_flags) || br.qual().unwrap() < cfg.mapq_threshold() {
+        if discard || (br.flag() & chk_flags) != 0 || br.mapq() < cfg.mapq_threshold() {
             // remove discarded read from block
             blk.decr_ix();
         } else {
             // Check we are still on the same contig
             let tid = br.tid().expect("No tid for mapped record");
-            let y = br.endpos().unwrap();
+            let y = br.endpos();
 
             let (old_tid, end_pos, cpgs) = curr.take().unwrap_or_else(|| {
                 let cpgs = rf

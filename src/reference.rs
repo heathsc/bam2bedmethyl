@@ -10,9 +10,9 @@ use std::{
 use anyhow::Context;
 use compress_io::compress::{CompressIo, Reader};
 use crossbeam_channel::{unbounded, Receiver};
-use rs_htslib::{
+use m_htslib::{
     faidx::{Faidx, Sequence},
-    hts::{hts_get_log_level, hts_set_log_level, HtsLogLevel},
+    hts::{get_log_level, set_log_level, HtsLogLevel, IdMap},
 };
 
 use crate::config::Config;
@@ -87,13 +87,13 @@ impl<'a> FastaFile<'a> {
         }
 
         // Get contig name
-        let name = Arc::from(parse_name(&self.buf).with_context(|| {
+        let name = parse_name(&self.buf).with_context(|| {
             format!(
                 "{}:{} Error reading FASTA name",
                 self.path.display(),
                 self.line
             )
-        })?);
+        })?.to_owned();
 
         // Read sequence
         trace!("Reading sequence {}", &name);
@@ -187,7 +187,7 @@ impl Reference {
     }
 
     fn add_contig(&mut self, ref_ctg: RefContig) -> anyhow::Result<()> {
-        let ctg = ref_ctg.name.clone();
+        let ctg = Arc::from(ref_ctg.name.as_str());
         match self.contig_seq.entry(ctg) {
             Entry::Occupied(_) => Err(anyhow!("Duplicate contig {} in fasta file", ref_ctg.name())),
             Entry::Vacant(e) => {
@@ -199,7 +199,7 @@ impl Reference {
 }
 
 pub struct RefContig {
-    name: Arc<str>,
+    name: String,
     cpgs: Vec<u64>, // Offsets from contig start to reference CpG positions
     seq: RefSeq,
     start: usize,
@@ -248,13 +248,11 @@ impl RefSeq {
 }
 
 fn find_cpgs(v: &[u8], start: usize) -> Vec<u64> {
-    let mut x = start as u64;
     let mut cpgs = Vec::new();
-    for p in v.windows(2) {
+    for (x, p) in v.windows(2).enumerate() {
         if p[0].eq_ignore_ascii_case(&b'C') && p[1].eq_ignore_ascii_case(&b'G') {
-            cpgs.push(x);
+            cpgs.push((x + start) as u64);
         }
-        x += 1;
     }
     cpgs
 }
@@ -262,13 +260,13 @@ fn find_cpgs(v: &[u8], start: usize) -> Vec<u64> {
 /// Try to load faidx index for reference file
 fn try_load_faidx<P: AsRef<Path>>(path: P) -> Option<Faidx> {
     // Turn off hts error logs as we are not going to fail if we don't find the index
-    let opt = hts_get_log_level();
-    hts_set_log_level(HtsLogLevel::Off);
+    let opt = get_log_level();
+    set_log_level(HtsLogLevel::Off);
 
     let faidx = Faidx::load(path).ok();
 
     // Reset original hts logging level
-    hts_set_log_level(opt);
+    set_log_level(opt);
 
     faidx
 }
@@ -281,7 +279,7 @@ fn faidx_load_thread(
 ) -> anyhow::Result<Reference> {
     debug!("Reference read thread {} starting up", ix);
     let path = cfg.ref_file();
-    let faidx = match f.take() {
+    let mut faidx = match f.take() {
         Some(x) => x,
         None => Faidx::load(path).with_context(|| {
             format!("Error loading index for reference file {}", path.display())
@@ -289,15 +287,14 @@ fn faidx_load_thread(
     };
     let mut reference = Reference::new(path);
     for ctg_ix in r.iter() {
-        let ctg = faidx.iseq(ctg_ix);
-
-        debug!("({}) Reading in sequence from {}", ix, ctg);
+        let ctg = faidx.seq_name(ctg_ix).ok_or_else(|| anyhow!("Error getting name for sequence {ctg_ix}"))?.to_owned();
+        debug!("({}) Reading in sequence from {:?}", ix, ctg);
 
         let seq = faidx
             .fetch_seq(&ctg, 0, None)
-            .with_context(|| format!("Error reading sequencing for {}", ctg))?;
+            .with_context(|| format!("Error reading sequencing for {:?}", ctg))?;
 
-        let name = Arc::from(ctg.to_str()?);
+        let name = ctg.to_str()?.to_owned();
 
         trace!("Finding CpGs for {}", name);
         let start = seq.start() - 1;
@@ -327,7 +324,7 @@ fn load_reference_from_faidx(cfg: &Config, faidx: Faidx) -> anyhow::Result<Refer
         "Loading faidx reference from {:?}",
         cfg.ref_file().display()
     );
-    let nseq = faidx.nseq();
+    let nseq = faidx.num_seqs();
     let seq_ids: Vec<_> = (0..nseq).collect();
     let nt = cfg.threads().min(nseq);
     let mut faidx = Some(faidx);

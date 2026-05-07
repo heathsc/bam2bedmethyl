@@ -5,13 +5,13 @@ pub mod process_block;
 
 use crossbeam_channel::{Receiver, Sender};
 
-use rs_htslib::sam::{BamRec, CigarOp, MMParse, parse_mod_tags};
+use m_htslib::sam::{BamRec, CigarOp, MMParse};
 
 use super::{
     config::Config,
     read::{
         pileup::{PileupCode, PileupEntry},
-        read_record::ReadRec,
+        read_record::ReadRecord,
     },
     reference::Reference,
 };
@@ -43,7 +43,7 @@ const PILEUP_ITEMS: [PileupCode; 8] = [
 fn process_record(
     cfg: &Config,
     rf: &[u8],
-    rrec: &ReadRec,
+    rrec: &ReadRecord,
     mm_parse: &mut MMParse,
     cb: &mut CountBlock,
 ) -> anyhow::Result<()> {
@@ -51,11 +51,10 @@ fn process_record(
     let y = rrec.end_pos() as usize;
     let rec = rrec.brec();
     // Find and parse MM/ML tags from record
-    if let Some(tags) = parse_mod_tags(rec, mm_parse)? {
+    if let Some(mod_iter) = mm_parse.mod_iter(rec)? {
         let mut cts: [u32; 4] = [0; 4];
 
         // Tags found.  Make iterator over modified positions
-        let mod_iter = mm_parse.mk_pos_iter(rec, &tags)?;
         let mut meth_itr = MethItr::new(mod_iter);
 
         // Threshold (on prob. scale of 0-255) for calling methylated or non-methylation sites

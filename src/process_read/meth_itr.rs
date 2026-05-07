@@ -1,4 +1,4 @@
-use rs_htslib::sam::{ModIter, SeqBase};
+use m_htslib::{base::Base, sam::ModIter};
 
 // Combine mod probabilities for the same position (i.e., for 5hmC and 5mC)
 pub(super) struct MethItr<'a, 'b> {
@@ -18,7 +18,7 @@ impl<'a, 'b> MethItr<'a, 'b> {
 }
 
 impl<'a, 'b: 'a> Iterator for MethItr<'a, 'b> {
-    type Item = (usize, SeqBase, Option<(u8, u8, bool)>);
+    type Item = (usize, Base, Option<(u8, u8, bool)>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
@@ -30,17 +30,18 @@ impl<'a, 'b: 'a> Iterator for MethItr<'a, 'b> {
             let p = if v.is_empty() {
                 None
             } else {
-                let (tp_m, tp_h) =
-                    v.iter()
-                        .fold((0, 0), |(t_m, t_h), (p, m)| match m.base_mod_code() {
-                            Some(b'm') => (t_m + (*p as usize), t_h),
-                            Some(b'h') => (t_m, t_h + (*p as usize)),
-                            _ => (t_m, t_h),
-                        });
+                let (tp_m, tp_h) = v.iter().fold((0, 0), |(t_m, t_h), m| {
+                    let ml = m.ml_value().unwrap_or(0) as usize;
+                    match m.base_mod_code() {
+                        Some(b'm') => (t_m + ml, t_h),
+                        Some(b'h') => (t_m, t_h + ml),
+                        _ => (t_m, t_h),
+                    }
+                });
                 Some((
                     tp_m.min(255) as u8,
                     tp_h.min(255) as u8,
-                    v[0].1.reverse_strand(),
+                    v[0].is_reversed(),
                 ))
             };
             self.seq_ix += 1;

@@ -22,4 +22,5 @@ libc = "~0.2"
 regex = "~1.10"
 rand = { version = "0.8.5", features = ["getrandom"] }
 rand_pcg = "~0.3"
-rs_htslib = { path = "../rs_htslib" }
+m_htslib = { git = "https://github.com/heathsc/m_htslib.git" }
+#m_htslib = { path = "../m_htslib" }

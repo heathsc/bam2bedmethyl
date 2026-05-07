@@ -1,24 +1,24 @@
-use rs_htslib::{hts::HtsPos, sam::BamRec};
+use m_htslib::{hts::HtsPos, sam::BamRec};
 
 use super::opt_index::OptIndex;
 
-pub struct ReadRec {
+pub struct ReadRecord {
     brec: BamRec,
     end_pos: HtsPos,
     pileup_ix: OptIndex,
 }
 
-impl Default for ReadRec {
+impl Default for ReadRecord {
     fn default() -> Self {
         Self {
-            brec: BamRec::new().expect("Couldn't allocated new BamRec"),
+            brec: BamRec::new(),
             end_pos: 0,
             pileup_ix: OptIndex::default(),
         }
     }
 }
 
-impl ReadRec {
+impl ReadRecord {
     #[inline]
     pub fn new() -> Self {
         Self::default()

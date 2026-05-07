@@ -5,7 +5,7 @@ use std::{
 
 use rand::{prelude::*, rngs::StdRng};
 
-use rs_htslib::hts::HtsThreadPool;
+use m_htslib::hts::HtsThreadPool;
 
 use super::{cli::cli_model, utils::init_log};
 
@@ -127,7 +127,7 @@ pub fn handle_cli() -> anyhow::Result<Config> {
 
     // If multiple treads requested, set up HtsThreadPool
     let hts_thread_pool = if threads > 1 {
-        HtsThreadPool::new(threads)
+        HtsThreadPool::init(threads)
     } else {
         None
     };
